@@ -55,7 +55,7 @@ def load_token() -> str:
 
 def get_llama_server_url() -> str:
     return _get_str(
-        "LLAMA_SERVER_URL", "http://192.168.10.119:8080/v1/chat/completions"
+        "LLAMA_SERVER_URL", ""
     )
 
 
