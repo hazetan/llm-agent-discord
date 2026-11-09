@@ -1,0 +1,25 @@
+python3 -c "
+import sqlite3
+from pathlib import Path
+
+db_path = Path.home() / 'discord-bot' / 'database' / 'data.db'
+conn = sqlite3.connect(db_path)
+cursor = conn.cursor()
+
+# goalsession テーブルへのカラム追加
+try:
+    cursor.execute('ALTER TABLE goalsession ADD COLUMN docker_container TEXT;')
+    print('✅ goalsession: docker_container カラムを追加しました')
+except Exception as e:
+    print(f'goalsession: {e}')
+
+# activity テーブルへのカラム追加
+try:
+    cursor.execute('ALTER TABLE activity ADD COLUMN session_id INTEGER;')
+    print('✅ activity: session_id カラムを追加しました')
+except Exception as e:
+    print(f'activity: {e}')
+
+conn.commit()
+conn.close()
+"

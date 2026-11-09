@@ -1,0 +1,9 @@
+discord.py
+aiohttp
+python-dotenv
+sqlalchemy
+fastapi
+uvicorn
+jinja2
+flask
+duckduckgo-search
