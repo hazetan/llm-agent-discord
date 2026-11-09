@@ -1,9 +1,6 @@
-discord.py
-aiohttp
-python-dotenv
+discord
 sqlalchemy
-fastapi
-uvicorn
-jinja2
-flask
-duckduckgo-search
+dotenv
+ddgs
+aiohttp
+docker

@@ -5,6 +5,10 @@ from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Integer, String
 from .db_system import Base
 
 
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 class GoalSession(Base):
     __tablename__ = "goalsession"
 
@@ -16,15 +20,11 @@ class GoalSession(Base):
     channel_id = Column(BigInteger, nullable=True, index=True)
     message_id = Column(BigInteger, nullable=True)
 
-    created_at = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-        nullable=False,
-    )
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at = Column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-        onupdate=lambda: datetime.now(UTC),
+        default=utc_now,
+        onupdate=utc_now,
         nullable=False,
     )
 
@@ -41,11 +41,7 @@ class Activity(Base):
     session_id = Column(Integer, ForeignKey("goalsession.id"), nullable=True, index=True)
     work = Column(Text, nullable=False)
     result = Column(Text, nullable=False)
-    datetime = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-        nullable=False,
-    )
+    datetime = Column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class Planner(Base):
@@ -59,27 +55,17 @@ class Planner(Base):
     result = Column(Text, nullable=True)
     future_issue = Column(Text, nullable=True)
     status = Column(String(32), default="pending", nullable=False, index=True)
-    datetime = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-        nullable=False,
-    )
+    datetime = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
 
 class TroubleshootingMemory(Base):
-  __tablename__ = "troubleshooting_memory"
+    __tablename__ = "troubleshooting_memory"
 
-  id = Column(Integer, primary_key=True, index=True)
-  # エラーの種別（例: 'docker_permission', 'port_conflict', 'token_cutoff', 'file_not_found' など）
-  category = Column(String(64), nullable=False, index=True)
-  # 発生する具体的なエラーメッセージやキーワード
-  error_pattern = Column(Text, nullable=False)
-  # その根本原因
-  root_cause = Column(Text, nullable=False)
-  # 具体的な対処法・回避策
-  solution = Column(Text, nullable=False)
-
-  created_at = Column(
-    DateTime(timezone=True),
-    default=lambda: datetime.now(UTC),
-    nullable=False,
-  )
+    id = Column(Integer, primary_key=True, index=True)
+    category = Column(String(64), nullable=False, index=True)
+    error_pattern = Column(Text, nullable=False)
+    root_cause = Column(Text, nullable=False)
+    solution = Column(Text, nullable=False)
+    # 生成された Embedding ベクトル（JSON 配列文字列）
+    embedding_json = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)

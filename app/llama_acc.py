@@ -1,69 +1,69 @@
+from typing import Any
+
 import aiohttp
 
-from .secret import get_llama_server_url, get_max_token
+from .secrets import get_llama_server_url, get_max_token
+
+DEFAULT_TIMEOUT_SECONDS = 2400
+DEFAULT_TEMPERATURE = 0.3
 
 
-async def ask_llm(
-    prompt: str,
-    system_prompt: str = "You are a concise and helpful programming assistant.",
-) -> str:
-    max_token = get_max_token()
-    payload = {
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.3,
-        "max_tokens": min(1024, max_token),
-        "stream": False,
-    }
+async def _post_completion(payload: dict[str, Any]) -> dict[str, Any]:
+    """llama-server へ POST リクエストを送信し，レスポンスの message オブジェクトを返す．"""
+    client_timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT_SECONDS)
 
-    client_timeout = aiohttp.ClientTimeout(total=2400)
     async with aiohttp.ClientSession(timeout=client_timeout) as session:
-        try:
-            async with session.post(
-                get_llama_server_url(), json=payload
-            ) as resp:
-                try:
-                    data = await resp.json()
-                except Exception:
-                    raw_text = await resp.text()
-                    return f"Error: llama-server returned HTTP {resp.status}: {raw_text}"
-
-                if resp.status == 200 and "choices" in data:
-                    return data["choices"][0]["message"]["content"]
-                else:
-                    return f"Error: llama-server returned status {resp.status} ({data})"
-        except Exception as e:
-            return f"Error connecting to llama-server: {e}"
-
-
-async def chat_with_tools(messages: list, tools: list | None = None) -> dict:
-    payload = {
-        "messages": messages,
-        "temperature": 0.3,
-        "max_tokens": get_max_token(),
-    }
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
-
-    client_timeout = aiohttp.ClientTimeout(total=2400)
-    async with aiohttp.ClientSession(timeout=client_timeout) as session:
-        async with session.post(
-            get_llama_server_url(), json=payload
-        ) as resp:
+        async with session.post(get_llama_server_url(), json=payload) as resp:
             try:
                 data = await resp.json()
-            except Exception:
+            except Exception as exc:
                 raw_text = await resp.text()
                 raise RuntimeError(
-                    f"llama-server error (HTTP {resp.status}): {raw_text}"
-                )
+                    f"llama-server returned HTTP {resp.status}: {raw_text}"
+                ) from exc
 
             if resp.status != 200 or "choices" not in data:
                 err_detail = data.get("error", data)
                 raise RuntimeError(
                     f"llama-server error (HTTP {resp.status}): {err_detail}"
                 )
+
             return data["choices"][0]["message"]
+
+
+async def ask_llm(
+    prompt: str,
+    system_prompt: str = "You are a concise and helpful programming assistant.",
+) -> str:
+    """単発の質問に対する LLM のテキスト応答を返す．"""
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": DEFAULT_TEMPERATURE,
+        "max_tokens": min(1024, get_max_token()),
+        "stream": False,
+    }
+    try:
+        message = await _post_completion(payload)
+        return message.get("content", "")
+    except Exception as exc:
+        return f"Error communicating with llama-server: {exc}"
+
+
+async def chat_with_tools(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Function Calling (Tools) 対応のチャット補完を実行する．"""
+    payload: dict[str, Any] = {
+        "messages": messages,
+        "temperature": DEFAULT_TEMPERATURE,
+        "max_tokens": get_max_token(),
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    return await _post_completion(payload)

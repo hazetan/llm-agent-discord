@@ -1,45 +1,59 @@
 import asyncio
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
+
+from sqlalchemy.orm import Session
 
 from .db_models import Activity, GoalSession, Planner
 from .db_system import SessionLocal
 from .llama_acc import chat_with_tools
-from .secret import (
+from .prompts_and_schemas import AGENT_SYSTEM_PROMPT, AVAILABLE_TOOLS
+from .rag_store import rag_store
+from .secrets import (
     get_max_steps,
     get_max_token,
     get_projects_dir,
     get_server_ctx_size,
 )
-from .tools import (
-    AVAILABLE_TOOLS,
-    execute_tool_async,
-    init_git_repo,
-    stop_docker_container,
-)
+from .tools import execute_tool_async, init_git_repo, stop_docker_container
 
-# セッションごとの割り込みキュー (session_id -> list[str])
 INTERVENTION_QUEUES: dict[int, list[str]] = {}
 
+MAX_OUTPUT_CHARS = 4000
+COMPLETION_KEYWORDS = ("完了", "finished", "complete")
+ERROR_INDICATORS = (
+    "error",
+    "exception",
+    "traceback",
+    "failed",
+    "permission denied",
+    "address already in use",
+    "not found",
+    "timed out",
+)
 
-def add_session_intervention(session_id: int, message: str):
+
+def add_session_intervention(session_id: int, message: str) -> None:
     INTERVENTION_QUEUES.setdefault(session_id, []).append(message)
 
 
-def extract_tool_call_from_text(content: str) -> dict | None:
+def extract_tool_call_from_text(content: str) -> dict[str, Any] | None:
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group(1))
-            if "name" in data and "arguments" in data:
-                return data
-        except Exception:
-            pass
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(1))
+        if isinstance(data, dict) and "name" in data and "arguments" in data:
+            return data
+    except Exception:
+        pass
     return None
 
 
-def parse_tool_arguments(raw_args) -> dict:
+def parse_tool_arguments(raw_args: Any) -> dict[str, Any]:
     if isinstance(raw_args, dict):
         return raw_args
     if isinstance(raw_args, str):
@@ -51,7 +65,7 @@ def parse_tool_arguments(raw_args) -> dict:
     return {}
 
 
-def build_handover_context(db, session_id: int) -> str:
+def build_handover_context(db: Session, session_id: int) -> str:
     latest_plan = (
         db.query(Planner)
         .filter(Planner.session_id == session_id)
@@ -62,110 +76,174 @@ def build_handover_context(db, session_id: int) -> str:
         return "No persistent planner history available."
 
     return (
-        f"--- [Project State Handover] ---\n"
+        "--- [Project State Handover] ---\n"
         f"Previous Issue : {latest_plan.current_issue}\n"
         f"Executed Task  : {latest_plan.task}\n"
         f"Task Result    : {latest_plan.result or 'In progress'}\n"
         f"Next Backlog   : {latest_plan.future_issue or 'None'}\n"
-        f"--------------------------------"
+        "--------------------------------"
     )
 
 
-def estimate_tokens(messages: list) -> int:
+def estimate_tokens(messages: list[dict[str, Any]]) -> int:
     total_chars = sum(len(str(m.get("content", ""))) for m in messages)
     return int(total_chars / 2.5) + 600
+
+
+def _prepare_session_workspace(session: GoalSession) -> Path:
+    if not session.project_dir:
+        project_path = get_projects_dir() / f"session_{session.id}"
+        session.project_dir = str(project_path)
+    else:
+        project_path = Path(session.project_dir)
+
+    project_path.mkdir(parents=True, exist_ok=True)
+    init_git_repo(project_path)
+    return project_path
+
+
+def _inject_user_interventions(
+    session_id: int, messages: list[dict[str, Any]]
+) -> None:
+    if not INTERVENTION_QUEUES.get(session_id):
+        return
+    interventions = INTERVENTION_QUEUES.pop(session_id)
+    for inject_msg in interventions:
+        messages.append(
+            {
+                "role": "user",
+                "content": f"[User Mid-Course Correction / Note]: {inject_msg}",
+            }
+        )
+
+
+def _compress_context_if_needed(
+    db: Session,
+    session: GoalSession,
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    prompt_token_limit = get_server_ctx_size() - get_max_token() - 1024
+    if len(messages) <= 16 and estimate_tokens(messages) <= prompt_token_limit:
+        return messages
+
+    handover_note = build_handover_context(db, session.id)
+    return [
+        messages[0],
+        {"role": "user", "content": f"Task: {session.objective}"},
+        {"role": "system", "content": handover_note},
+        *messages[-8:],
+    ]
+
+
+async def _inject_rag_hint_on_error(
+    tool_output: str,
+    messages: list[dict[str, Any]],
+    injected_memory_ids: set[int],
+) -> None:
+    """ツール出力にエラー兆候がある場合，ベクターストアを動的検索して解決ヒントを注入する．"""
+    lower_out = tool_output.lower()
+    if not any(indicator in lower_out for indicator in ERROR_INDICATORS):
+        return
+
+    matched_memories = await rag_store.search_relevant_memories(tool_output)
+    new_memories = [m for m in matched_memories if m.id not in injected_memory_ids]
+    if not new_memories:
+        return
+
+    for m in new_memories:
+        injected_memory_ids.add(m.id)
+
+    rag_hint = rag_store.format_as_prompt_context(
+        new_memories, header="RAG Auto-Retrieved Troubleshooting Hint"
+    )
+    messages.append({"role": "system", "content": rag_hint})
+
+
+async def _request_llm_with_retry(
+    messages: list[dict[str, Any]], max_retries: int = 2
+) -> dict[str, Any]:
+    for attempt in range(max_retries):
+        try:
+            return await chat_with_tools(messages, tools=AVAILABLE_TOOLS)
+        except Exception as exc:
+            if attempt + 1 >= max_retries:
+                raise
+            await asyncio.sleep(2)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Tool execution failed with server error ({exc}). "
+                        "Retry with concise parameters."
+                    ),
+                }
+            )
+    raise RuntimeError("Unreachable retry state")
+
+
+def _truncate_output(output: str) -> str:
+    if len(output) > MAX_OUTPUT_CHARS:
+        return output[:MAX_OUTPUT_CHARS] + "\n...(output truncated)..."
+    return output
+
+
+def _record_activity(
+    db: Session, session_id: int, tool_name: str, args: dict[str, Any], result: str
+) -> None:
+    args_summary = json.dumps(args, ensure_ascii=False)[:300]
+    activity = Activity(
+        session_id=session_id,
+        work=f"[{tool_name}] {args_summary}",
+        result=result[:500],
+    )
+    db.add(activity)
+    db.commit()
 
 
 async def run_agent_loop(
     session_id: int,
     max_steps: int | None = None,
-    dashboard_callback=None,
-    human_ask_callback=None,
+    dashboard_callback: Callable | None = None,
+    human_ask_callback: Callable | None = None,
 ) -> str:
     if max_steps is None:
         max_steps = get_max_steps()
 
     db = SessionLocal()
-    project_path = None
     try:
         session = db.query(GoalSession).filter(GoalSession.id == session_id).first()
         if not session:
             return "Session not found."
 
-        if not session.project_dir:
-            project_path = get_projects_dir() / f"session_{session_id}"
-            project_path.mkdir(parents=True, exist_ok=True)
-            session.project_dir = str(project_path)
-        else:
-            project_path = Path(session.project_dir)
-            project_path.mkdir(parents=True, exist_ok=True)
-
+        project_path = _prepare_session_workspace(session)
         session.status = "running"
         db.commit()
 
-        # Git リポジトリ初期化
-        init_git_repo(project_path)
+        # 初期 RAG 検索: タスク目標に関連する過去のトラブルシューティング知見を抽出
+        initial_memories = await rag_store.search_relevant_memories(session.objective)
+        injected_memory_ids: set[int] = {m.id for m in initial_memories}
+        rag_initial_block = rag_store.format_as_prompt_context(initial_memories)
 
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an elite autonomous engineering agent operating inside an isolated Docker sandbox.\n"
-                    "Environment constraints:\n"
-                    "- All command executions strictly run in Docker container (/workspace).\n"
-                    "- Before starting complex operations, use 'record_plan' to document issue and tasks.\n"
-                    "- Use 'list_files' to inspect directory and 'read_file' to view code.\n"
-                    "- For modifying existing files, PREFER 'replace_in_file' for small edits or 'write_file' for whole files.\n"
-                    "- Keep code modular. If implementing complex applications (like games or web apps), divide logic into separate files (e.g. state.js, pieces.js, ui.js) instead of dumping thousands of lines into a single call.\n"
-                    "- Ensure that JSON payloads and string contents are completed and not abruptly cut off.\n"
-                    "- When developing large single-page applications or complex HTML/JS:\n"
-                    "  1. Create a minimal skeleton first via 'write_file' (e.g. basic HTML structure with placeholders or comments like '<!-- JS_LOGIC -->' or '</body>').\n"
-                    "  2. Use 'insert_into_file' to incrementally inject functions, event listeners, and data models in small chunks instead of overwriting the whole file.\n"
-                    "  3. This avoids output token truncation and keeps tool calls concise.\n"
-                    "- Use 'git_diff' to inspect code changes and 'git_revert' if an action broke the project.\n"
-                    "- When using 'web_search', keep queries concise and limited to 2-3 key terms\n"
-                    "- If you lack domain info or need latest docs, invoke 'web_search' or 'fetch_url'.\n"
-                    "- If requirements or credentials are truly missing, ask human directly via 'ask_human'.\n"
-                    "- Test code syntax and behavior via 'run_command'.\n"
-                    "- Conclude sub-steps using 'update_plan_result'.\n"
-                    "- Once fully verified and satisfied, call 'finish_task'. The 'result' parameter MUST be written in polite, clear Japanese detailing accomplishments and key files.\n"
-                    "- IMPORTANT: Invoke tools directly. Do NOT output markdown code blocks in text."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Task Objective: {session.objective}",
-            },
+        system_content = (
+            f"{AGENT_SYSTEM_PROMPT}\n\n{rag_initial_block}"
+            if rag_initial_block
+            else AGENT_SYSTEM_PROMPT
+        )
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": f"Task Objective: {session.objective}"},
         ]
 
-        final_result = f"Reached maximum allowed steps ({max_steps}) without calling finish_task."
-        last_tool_signature = None
+        final_result = (
+            f"Reached maximum allowed steps ({max_steps}) without calling finish_task."
+        )
+        last_tool_signature: str | None = None
         repeat_count = 0
 
         for step in range(1, max_steps + 1):
-            # ユーザーからの途中割り込み指示があればプロンプトにインジェクト
-            if INTERVENTION_QUEUES.get(session_id):
-                interventions = INTERVENTION_QUEUES.pop(session_id)
-                for inject_msg in interventions:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": f"[User Mid-Course Correction / Note]: {inject_msg}",
-                        }
-                    )
-
-            server_ctx_size = get_server_ctx_size()
-            current_max_token = get_max_token()
-            prompt_token_limit = server_ctx_size - current_max_token - 1024
-
-            # コンテキスト自動圧縮
-            if len(messages) > 16 or estimate_tokens(messages) > prompt_token_limit:
-                handover_note = build_handover_context(db, session_id)
-                messages = [
-                    messages[0],
-                    {"role": "user", "content": f"Task: {session.objective}"},
-                    {"role": "system", "content": handover_note},
-                ] + messages[-8:]
+            _inject_user_interventions(session_id, messages)
+            messages = _compress_context_if_needed(db, session, messages)
 
             if dashboard_callback:
                 await dashboard_callback(
@@ -174,27 +252,9 @@ async def run_agent_loop(
                     status="Thinking (LLM推論中)...",
                 )
 
-            retry_count = 0
-            response_msg = None
-            while retry_count < 2:
-                try:
-                    response_msg = await chat_with_tools(
-                        messages, tools=AVAILABLE_TOOLS
-                    )
-                    break
-                except Exception as e:
-                    retry_count += 1
-                    if retry_count >= 2:
-                        raise e
-                    await asyncio.sleep(2)
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": f"Tool execution failed with server error ({e}). Retry with concise parameters.",
-                        }
-                    )
-
+            response_msg = await _request_llm_with_retry(messages)
             messages.append(response_msg)
+
             content = response_msg.get("content", "").strip()
             tool_calls = response_msg.get("tool_calls")
 
@@ -206,7 +266,6 @@ async def run_agent_loop(
                     status="Tool Dispatching...",
                 )
 
-            # ツール呼び出し無しの場合のフォールバック
             if not tool_calls:
                 fallback_tool = extract_tool_call_from_text(content)
                 if fallback_tool:
@@ -215,26 +274,22 @@ async def run_agent_loop(
                             "id": f"fallback_call_{step}",
                             "function": {
                                 "name": fallback_tool["name"],
-                                "arguments": json.dumps(
-                                    fallback_tool["arguments"]
-                                ),
+                                "arguments": json.dumps(fallback_tool["arguments"]),
                             },
                         }
                     ]
+                elif content and any(k in content.lower() for k in COMPLETION_KEYWORDS):
+                    session.status = "completed"
+                    db.commit()
+                    return content
                 else:
-                    if content and any(
-                        w in content.lower()
-                        for w in ["完了", "finished", "complete"]
-                    ):
-                        final_result = content
-                        session.status = "completed"
-                        db.commit()
-                        return final_result
-
                     messages.append(
                         {
                             "role": "user",
-                            "content": "Do not explain your steps in text. Directly invoke the appropriate tool using the function calling schema.",
+                            "content": (
+                                "Do not explain your steps in text. Directly invoke "
+                                "the appropriate tool using the function calling schema."
+                            ),
                         }
                     )
                     continue
@@ -263,8 +318,8 @@ async def run_agent_loop(
 
                 if repeat_count >= 1:
                     tool_output = (
-                        f"Error: Repetitive action detected for '{tool_name}'. Proceed to next verification "
-                        f"step or call 'finish_task'."
+                        f"Error: Repetitive action detected for '{tool_name}'. "
+                        "Proceed to next verification step or call 'finish_task'."
                     )
                 else:
                     tool_output = await execute_tool_async(
@@ -275,11 +330,7 @@ async def run_agent_loop(
                         human_ask_callback=human_ask_callback,
                     )
 
-                truncated_output = (
-                    tool_output[:4000] + "\n...(output truncated)..."
-                    if len(tool_output) > 4000
-                    else tool_output
-                )
+                truncated_output = _truncate_output(tool_output)
 
                 if dashboard_callback:
                     await dashboard_callback(
@@ -292,13 +343,7 @@ async def run_agent_loop(
                         status="Step Completed",
                     )
 
-                act = Activity(
-                    session_id=session_id,
-                    work=f"[{tool_name}] {json.dumps(args, ensure_ascii=False)[:300]}",
-                    result=truncated_output[:500],
-                )
-                db.add(act)
-                db.commit()
+                _record_activity(db, session_id, tool_name, args, truncated_output)
 
                 if tool_name == "finish_task":
                     final_result = tool_output
@@ -311,6 +356,11 @@ async def run_agent_loop(
                         "name": tool_name,
                         "content": truncated_output,
                     }
+                )
+
+                # エラー出力検知時に RAG ベクターストアから解決ヒントを動的注入
+                await _inject_rag_hint_on_error(
+                    truncated_output, messages, injected_memory_ids
                 )
 
             if finish_called:
@@ -330,16 +380,15 @@ async def run_agent_loop(
             db.commit()
         raise
 
-    except Exception as e:
+    except Exception as exc:
         db.rollback()
         session = db.query(GoalSession).filter(GoalSession.id == session_id).first()
         if session:
             session.status = "failed"
             db.commit()
-        return f"Agent failed with error: {e}"
+        return f"Agent failed with error: {exc}"
 
     finally:
-        # Docker コンテナの破棄
         stop_docker_container(session_id)
         INTERVENTION_QUEUES.pop(session_id, None)
         db.close()

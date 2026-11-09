@@ -2,7 +2,7 @@
 docker pull python:3.12-slim
 
 # 2. データベースマイグレーション（カラムが無ければ追加、既にあればエラーを無視）
-DB_PATH="/home/hazetan/discord-bot/database/data.db"
+DB_PATH="/home/hazetan/discord-bot/.database/data.db"
 
 sqlite3 "$DB_PATH" "ALTER TABLE goalsession ADD COLUMN docker_container TEXT;" 2>/dev/null || true
 sqlite3 "$DB_PATH" "ALTER TABLE activity ADD COLUMN session_id INTEGER;" 2>/dev/null || true
