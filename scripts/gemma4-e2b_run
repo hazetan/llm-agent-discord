@@ -1,7 +1,0 @@
-./llama_cpp/llama-server \
-    -m ./llm_models/Gemma-4-E2B-Abliterated.Q4_K_M.gguf \
-    --host 127.0.0.1 \
-    --port 8080 \
-    -c 2048 \
-    --threads 4 \
-    -lm none

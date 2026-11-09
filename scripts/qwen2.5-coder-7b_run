@@ -1,7 +1,0 @@
-./llama_cpp/llama-server \
-    -m ./llm_models/qwen2.5-coder-7b-instruct-q4_k_m.gguf \
-    --host 127.0.0.1 \
-    --port 8080 \
-    -c 4096 \
-    --threads 4 \
-    -lm none
