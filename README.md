@@ -1,4 +1,4 @@
-# Discord_Bot
+# LLM-Agent-Discord
 
 
 ## 1. プロジェクト概要
