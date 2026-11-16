@@ -117,6 +117,49 @@ class AgentDashboardView(discord.ui.View):
                 ephemeral=True,
             )
 
+    @discord.ui.button(
+        label="▶️ 続行", style=discord.ButtonStyle.success, custom_id="btn_continue"
+    )
+    async def continue_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        from .agent_runner import add_session_intervention
+
+        with get_db_session() as db:
+            session = db.query(GoalSession).filter(GoalSession.id == self.session_id).first()
+            if not session:
+                await interaction.response.send_message("セッションが見つかりません．", ephemeral=True)
+                return
+            
+            # 既に実行中・待機中の場合はブロック
+            if session.status in ["running", "pending"]:
+                await interaction.response.send_message(
+                    "このセッションは現在実行中または待機中です．", ephemeral=True
+                )
+                return
+            
+            # ステータスを待機中に戻す
+            session.status = "pending"
+            objective = session.objective
+            db.commit()
+
+        # エージェントへの割り込み指示（手直し要求）をキューに積む
+        add_session_intervention(
+            self.session_id, 
+            "ユーザーからの指示: 先ほどの報告ではプロジェクトが完全に完成していませんでした。不足している機能の実装、エラーの修正、および完全な動作確認を続行してください。"
+        )
+
+        await interaction.response.send_message(
+            f"▶️ セッション #{self.session_id} の作業を再開し，タスクキューへ再投入しました．", 
+            ephemeral=True
+        )
+
+        # 既存のダッシュボード下部に新しく再開用のダッシュボードを生成してキュー投入
+        # ※ enqueue_agent_with_dashboard は同ファイル内で定義されている前提です
+        asyncio.create_task(
+            enqueue_agent_with_dashboard(interaction.channel, self.session_id, objective)
+        )
+
 
 async def enqueue_agent_with_dashboard(
     channel: discord.abc.Messageable,

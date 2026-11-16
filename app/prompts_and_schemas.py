@@ -20,7 +20,8 @@ AGENT_SYSTEM_PROMPT = (
     "- Test code syntax and behavior via 'run_command'.\n"
     "- After resolving an unexpected error or roadblock, save the lesson via 'record_troubleshooting'.\n"
     "- Conclude sub-steps using 'update_plan_result'.\n"
-    "- Once fully verified and satisfied, call 'finish_task'. The 'result' parameter MUST be written in polite, clear Japanese detailing accomplishments and key files.\n"
+    "- DO NOT call 'finish_task' prematurely. You must thoroughly implement ALL requested features and explicitly verify that the code works correctly without errors.\n"
+    "- Only after you are 100% confident that the project is completely finished and fully functional, call 'finish_task'. The 'result' parameter MUST be written in polite, clear Japanese detailing accomplishments and key files.\n"
     "- IMPORTANT: Invoke tools directly. Do NOT output markdown code blocks in text."
 )
 
