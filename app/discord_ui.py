@@ -49,10 +49,6 @@ class ContinuePromptModal(discord.ui.Modal, title="プロンプトを追加し�
         self.session_id = session_id
 
     async def on_submit(self, interaction: discord.Interaction):
-
-        # 既存の enqueue_agent_with_dashboard 関数が同一ファイル内にある前提
-        # 別ファイルにある場合は from .xxx import enqueue_agent_with_dashboard のようにインポートしてください
-
         prompt_text = self.prompt_input.value
 
         with get_db_session() as db:
@@ -61,17 +57,14 @@ class ContinuePromptModal(discord.ui.Modal, title="プロンプトを追加し�
                 await interaction.response.send_message("セッションが見つかりません．", ephemeral=True)
                 return
             
-            # 再開可能なステータスかチェック
             if session.status in ["running", "pending"]:
                 await interaction.response.send_message("実行中・待機中のため再開できません．", ephemeral=True)
                 return
                 
-            # ステータスを待機中に戻す
             session.status = "pending"
             objective = session.objective
             db.commit()
 
-        # エージェントへの割り込み指示（追加プロンプト）を注入
         add_session_intervention(
             self.session_id, 
             f"ユーザーからの追加指示・修正要望: {prompt_text}\nこの指示に従って作業を続行し、完全に動作することを確認してから完了してください。"
@@ -82,7 +75,6 @@ class ContinuePromptModal(discord.ui.Modal, title="プロンプトを追加し�
             ephemeral=True
         )
 
-        # タスクキューへ再投入してダッシュボードを再生成
         asyncio.create_task(
             enqueue_agent_with_dashboard(interaction.channel, self.session_id, objective)
         )
@@ -142,7 +134,7 @@ class AgentDashboardView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="今すぐZIP出力",
+        label="ZIP出力",
         style=discord.ButtonStyle.primary,
         custom_id="btn_zip",
     )
@@ -157,6 +149,13 @@ class AgentDashboardView(discord.ui.View):
 
         await interaction.response.defer(ephemeral=True)
         zip_path = package_project_to_zip(self.project_dir, self.session_id)
+        
+        with get_db_session() as db:
+            session = db.query(GoalSession).filter(GoalSession.id == self.session_id).first()
+            if session:
+                session.artifact_zip = str(zip_path)
+                db.commit()
+
         if zip_path.stat().st_size < MAX_ZIP_BYTES:
             await interaction.followup.send(
                 content=f"セッション #{self.session_id} 現時点のスナップショット:",
@@ -183,19 +182,16 @@ class AgentDashboardView(discord.ui.View):
                 await interaction.response.send_message("セッションが見つかりません．", ephemeral=True)
                 return
             
-            # 既に実行中・待機中の場合はブロック
             if session.status in ["running", "pending"]:
                 await interaction.response.send_message(
                     "このセッションは現在実行中または待機中です．", ephemeral=True
                 )
                 return
             
-            # ステータスを待機中に戻す
             session.status = "pending"
             objective = session.objective
             db.commit()
 
-        # エージェントへの割り込み指示（手直し要求）をキューに積む
         add_session_intervention(
             self.session_id, 
             "ユーザーからの指示: 先ほどの報告ではプロジェクトが完全に完成していませんでした。不足している機能の実装、エラーの修正、および完全な動作確認を続行してください。"
@@ -206,11 +202,30 @@ class AgentDashboardView(discord.ui.View):
             ephemeral=True
         )
 
-        # 既存のダッシュボード下部に新しく再開用のダッシュボードを生成してキュー投入
-        # ※ enqueue_agent_with_dashboard は同ファイル内で定義されている前提です
         asyncio.create_task(
             enqueue_agent_with_dashboard(interaction.channel, self.session_id, objective)
         )
+    
+    @discord.ui.button(
+        label="指示を追加して続行", style=discord.ButtonStyle.primary, custom_id="btn_continue_with_prompt"
+    )
+    async def continue_with_prompt_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        
+        with get_db_session() as db:
+            session = db.query(GoalSession).filter(GoalSession.id == self.session_id).first()
+            if not session:
+                await interaction.response.send_message("セッションが見つかりません．", ephemeral=True)
+                return
+            
+            if session.status in ["running", "pending"]:
+                await interaction.response.send_message(
+                    "このセッションは現在実行中または待機中です．", ephemeral=True
+                )
+                return
+
+        await interaction.response.send_modal(ContinuePromptModal(self.session_id))
 
 
 async def enqueue_agent_with_dashboard(
@@ -218,6 +233,7 @@ async def enqueue_agent_with_dashboard(
     session_id: int,
     objective: str,
     reply_msg_id: int | None = None,
+    user_id: int | None = None,
 ) -> None:
     """ダッシュボードを作成し，非同期タスクキューへエージェントジョブを登録する．"""
     project_dir = get_projects_dir() / f"session_{session_id}"
@@ -298,10 +314,11 @@ async def enqueue_agent_with_dashboard(
             pass
 
     async def human_ask_listener(question: str) -> str:
+        mention = f"<@{user_id}> " if user_id else ""
         prompt_text = (
             f"**[エージェントからの質問] (Session #{session_id})**\n"
             f"> {question}\n\n"
-            f"返答するにはこのチャンネルで `./tell {question[:15]}...` または直接返信してください．"
+            f"{mention}返答するにはこのチャンネルで `!tell {question[:15]}...` または直接返信してください．"
         )
         await channel.send(prompt_text)
 
@@ -325,25 +342,12 @@ async def enqueue_agent_with_dashboard(
 
             embed.color = discord.Color.green()
             embed.set_field_at(
-                0, name="進捗", value="✅ **完了 (Completed)**", inline=False
+                0, name="進捗", value="**完了 (Completed)**", inline=False
             )
             await dashboard_msg.edit(embed=embed, view=view)
 
             final_report = f"**[Session #{session_id} 成果報告]**\n{result}"
             await send_chunked_message(channel, final_report)
-
-            with get_db_session() as db:
-                sess = db.query(GoalSession).filter(GoalSession.id == session_id).first()
-                if sess and sess.project_dir and Path(sess.project_dir).exists():
-                    zip_path = package_project_to_zip(Path(sess.project_dir), session_id)
-                    sess.artifact_zip = str(zip_path)
-                    db.commit()
-
-                    if zip_path.stat().st_size < MAX_ZIP_BYTES:
-                        await channel.send(
-                            content=f"**[成果物ZIP]** セッション #{session_id} の完成パッケージです．",
-                            file=discord.File(str(zip_path)),
-                        )
 
         except asyncio.CancelledError:
             embed.color = discord.Color.red()

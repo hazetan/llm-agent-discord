@@ -1,4 +1,6 @@
+import asyncio
 import re
+import shutil
 from datetime import UTC, timedelta, timezone
 
 import discord
@@ -6,14 +8,14 @@ from discord.ext import commands
 
 from .agent_runner import add_session_intervention
 from .db_models import Activity, GoalSession
-from .db_system import get_db_session, init_db
+from .db_system import SessionLocal, get_db_session, init_db
 from .discord_ui import (
     enqueue_agent_with_dashboard,
     pending_human_questions,
     send_chunked_message,
 )
 from .llama_acc import ask_llm
-from .secrets import get_projects_dir, load_token
+from .secrets import get_projects_dir, get_workspace_dir, load_token
 from .task_queue import agent_task_queue
 
 JST = timezone(timedelta(hours=9))
@@ -59,7 +61,7 @@ async def on_ready() -> None:
                 continue
 
             await channel.send(
-                f"🔄 **[システム再起動]** セッション #{sess.id} をタスクキューへ再投入します．"
+                f"**[システム再起動]** セッション #{sess.id} をタスクキューへ再投入します．"
             )
             await enqueue_agent_with_dashboard(
                 channel, sess.id, sess.objective, reply_msg_id=sess.message_id
@@ -67,34 +69,59 @@ async def on_ready() -> None:
 
 
 @bot.command(name="run")
-async def run_task(ctx: commands.Context, *, objective: str) -> None:
-    """新規自律エージェントセッションを作成し，非同期タスクキューへ投入する．"""
-    with get_db_session() as db:
+async def start_task(ctx, *, objective: str):
+    slug_prompt = (
+        "次のタスク目標から、プロジェクトを保存するための適切なディレクトリ名を1つだけ出力してください。\n"
+        "条件: 英小文字、数字、アンダースコア(_)のみを使用し、空白や他の記号は含めないこと。説明文は一切不要です。\n"
+        "※ただし、タスクが「全体を検索する」「既存の全プロジェクトを調べる」といった内容で、特定のプロジェクトに隔離しない方が良い場合は、特殊キーワード 'workspace_root' と出力してください。\n"
+        f"例: shogi_gui, web_server, react_todo_app, workspace_root\n"
+        f"タスク目標: {objective}"
+    )
+    
+    async with ctx.typing():
+        slug_result = await ask_llm(slug_prompt)
+        clean_slug = re.sub(r'[^a-z0-9_]', '', slug_result.strip().lower())
+        
+        if not clean_slug:
+            clean_slug = "default_project"
+
+    db = SessionLocal()
+    try:
         session = GoalSession(
             title=objective[:30],
             objective=objective,
             status="pending",
             channel_id=ctx.channel.id,
             message_id=ctx.message.id,
+            project_slug=clean_slug,
         )
         db.add(session)
         db.commit()
         db.refresh(session)
         session_id = session.id
 
-        proj_dir = get_projects_dir() / f"session_{session_id}"
-        proj_dir.mkdir(parents=True, exist_ok=True)
+        if clean_slug == "workspaceroot" or clean_slug == "workspace_root":
+            proj_dir = get_projects_dir()
+            display_name = "全体のワークスペース"
+        else:
+            proj_dir = get_projects_dir() / clean_slug
+            proj_dir.mkdir(parents=True, exist_ok=True)
+            display_name = clean_slug
+
         session.project_dir = str(proj_dir)
         db.commit()
+    finally:
+        db.close()
+
+    await ctx.reply(f"プロジェクトディレクトリ `{display_name}` を作成/選択し、セッション #{session_id} を開始します！")
 
     await enqueue_agent_with_dashboard(
-        ctx.channel, session_id, objective, reply_msg_id=ctx.message.id
+        ctx.channel, session_id, objective, reply_msg_id=ctx.message.id, user_id=ctx.author.id
     )
 
 
 @bot.command(name="stop")
 async def stop_task(ctx: commands.Context, session_id: int | None = None) -> None:
-    """実行中またはキュー待機中のセッションを中断する．"""
     active_ids = agent_task_queue.get_active_session_ids()
     target_id = session_id or (max(active_ids) if active_ids else None)
     if not target_id:
@@ -109,18 +136,17 @@ async def stop_task(ctx: commands.Context, session_id: int | None = None) -> Non
 
 @bot.command(name="queue")
 async def queue_status(ctx: commands.Context) -> None:
-    """タスクキューの稼働状況と待機リストを表示する．"""
     summary = agent_task_queue.get_status_summary()
     running = summary["running_sessions"]
     queued = summary["queued_sessions"]
 
     lines = [
-        "**📊 タスクキュー稼働状況**",
+        "**タスクキュー稼働状況**",
         f"• **最大同時実行ワーカー数**: `{summary['max_workers']}`",
         f"• **現在実行中のセッション**: {running if running else 'なし'}",
     ]
     if queued:
-        lines.append("\n**⏳ キュー待機中のセッション:**")
+        lines.append("\n**キュー待機中のセッション:**")
         for idx, item in enumerate(queued, 1):
             lines.append(
                 f"{idx}. `Session #{item['session_id']}` - {item['objective']}..."
@@ -133,7 +159,6 @@ async def queue_status(ctx: commands.Context) -> None:
 
 @bot.command(name="tell")
 async def tell_agent(ctx: commands.Context, *, message: str) -> None:
-    """ask_human で回答待機中のエージェントへ返答を送る．"""
     if pending_human_questions:
         target_id = max(pending_human_questions.keys())
         fut = pending_human_questions[target_id]
@@ -148,7 +173,6 @@ async def tell_agent(ctx: commands.Context, *, message: str) -> None:
 
 @bot.command(name="inject")
 async def inject_task(ctx: commands.Context, *, message: str) -> None:
-    """実行中エージェントの次ステップへ割り込み指示を送信する．"""
     active_ids = agent_task_queue.get_active_session_ids()
     if not active_ids:
         await ctx.reply("実行中のタスクがありません．")
@@ -160,10 +184,74 @@ async def inject_task(ctx: commands.Context, *, message: str) -> None:
         f"セッション #{target_id} の次ステップへ指示を割り込ませました: `{message}`"
     )
 
+@bot.command(name="start_from")
+async def start_from_task(ctx: commands.Context, source_dir_name: str, *, objective: str) -> None:
+    workspace_dir = get_workspace_dir()
+    source_path = workspace_dir / source_dir_name
+    
+    if not source_path.exists() or not source_path.is_dir():
+        await ctx.reply(f"指定されたフォルダ `{source_dir_name}` がワークスペース内に見つかりません。")
+        return
+
+    slug_prompt = (
+        "次のタスク目標から、プロジェクトを保存するための適切なディレクトリ名を1つだけ出力してください。\n"
+        "条件: 英小文字、数字、アンダースコア(_)のみを使用し、空白や他の記号は含めないこと。説明文は一切不要です。\n"
+        "※ただし、タスクが「全体を検索する」「既存の全プロジェクトを調べる」といった内容で、特定のプロジェクトに隔離しない方が良い場合は、特殊キーワード 'workspace_root' と出力してください。\n"
+        f"例: shogi_gui, web_server, react_todo_app, workspace_root\n"
+        f"タスク目標: {objective}"
+    )
+
+    async with ctx.typing():
+        slug_result = await ask_llm(slug_prompt)
+        clean_slug = re.sub(r'[^a-z0-9_]', '', slug_result.strip().lower())
+        if not clean_slug:
+            clean_slug = "default_project"
+
+    db = SessionLocal()
+    try:
+        enhanced_objective = (
+            f"提供された既存のコード資産をベースに開発を行ってください。\n"
+            f"まずはファイル一覧や中身を確認して現状を把握し、次の目標を達成してください: {objective}"
+        )
+
+        session = GoalSession(
+            title=objective[:30],
+            objective=enhanced_objective,
+            status="pending",
+            channel_id=ctx.channel.id,
+            message_id=ctx.message.id,
+            project_slug=clean_slug,
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        session_id = session.id
+
+        if clean_slug == "workspaceroot" or clean_slug == "workspace_root":
+            proj_dir = get_projects_dir()
+            display_name = "全体のワークスペース"
+        else:
+            proj_dir = get_projects_dir() / clean_slug
+            if not proj_dir.exists():
+                shutil.copytree(source_path, proj_dir)
+            else:
+                shutil.copytree(source_path, proj_dir, dirs_exist_ok=True)
+            display_name = clean_slug
+            
+        session.project_dir = str(proj_dir)
+        db.commit()
+    finally:
+        db.close()
+
+    await ctx.reply(f"`{source_dir_name}` のコード資産をコピーして、プロジェクトディレクトリ `{display_name}` にてセッション #{session_id} を開始します！")
+    
+    await enqueue_agent_with_dashboard(
+        ctx.channel, session_id, enhanced_objective, reply_msg_id=ctx.message.id, user_id=ctx.author.id
+    )
+
 
 @bot.command(name="project_status")
 async def project_status(ctx: commands.Context) -> None:
-    """最新セッションのステータスと直近のアクティビティを表示する．"""
     with get_db_session() as db:
         latest = db.query(GoalSession).order_by(GoalSession.id.desc()).first()
         if not latest:
@@ -224,11 +312,93 @@ async def on_message(message: discord.Message) -> None:
             return
 
         async with message.channel.typing():
-            response_text = await ask_llm(clean_prompt)
+            # ▼ 修正：意図判定と受領メッセージを同時に作らせる JSON プロンプト
+            intent_prompt = (
+                "以下のユーザーの発言が、「単なる雑談や簡単な質問」か、"
+                "それとも「コードの作成、ファイルの編集、コマンドの実行など、"
+                "ワークスペース上での何らかの作業依頼」かを判定してください。\n\n"
+                "必ず以下の JSON 形式で出力してください。Markdown のコードブロック(```json ... ```)は不要です。\n"
+                "{\n"
+                '  "intent": "TASK または CHAT",\n'
+                '  "reply": "TASKの場合: 作業を引き受ける際の、頼もしいアシスタントとしての自然な日本語の返事（例: 了解しました！〇〇の機能ですね。さっそくプロジェクトを立ち上げて開発を開始します！）。CHATの場合: 空文字"\n'
+                "}\n\n"
+                f"ユーザーの発言: {clean_prompt}"
+            )
+            
+            intent_result = await ask_llm(intent_prompt)
+            
+            # JSON パースの試行
+            intent = "CHAT"
+            reply_text = "作業を開始します。"
+            try:
+                import json
+                # Markdown ブロックがあれば除去
+                clean_json_str = re.sub(r"```(?:json)?\s*(.*?)\s*```", r"\1", intent_result, flags=re.DOTALL).strip()
+                data = json.loads(clean_json_str)
+                intent = data.get("intent", "CHAT").strip().upper()
+                reply_text = data.get("reply", "了解しました。作業用のエージェント環境を準備しますね！")
+            except Exception:
+                # パース失敗時のフォールバック
+                if "TASK" in intent_result.upper():
+                    intent = "TASK"
 
-        await send_chunked_message(
-            message.channel, response_text, reply_target=message
-        )
+            if "TASK" in intent:
+                # ▼ 修正：機械的な定型文ではなく、LLMが考えた自然な返事を使う
+                await message.reply(f"🚀 {reply_text}")
+                
+                slug_prompt = (
+                    "次のタスク目標から、プロジェクトを保存するための適切なディレクトリ名を1つだけ出力してください。\n"
+                    "条件: 英小文字、数字、アンダースコア(_)のみを使用し、空白や他の記号は含めないこと。説明文は一切不要です。\n"
+                    "※ただし、タスクが「全体を検索する」「既存の全プロジェクトを調べる」といった内容で、特定のプロジェクトに隔離しない方が良い場合は、特殊キーワード 'workspace_root' と出力してください。\n"
+                    f"例: shogi_gui, web_server, react_todo_app, workspace_root\n"
+                    f"タスク目標: {clean_prompt}"
+                )
+                
+                slug_result = await ask_llm(slug_prompt)
+                clean_slug = re.sub(r'[^a-z0-9_]', '', slug_result.strip().lower())
+                
+                if not clean_slug:
+                    clean_slug = "default_project"
+
+                db = SessionLocal()
+                try:
+                    session = GoalSession(
+                        title=clean_prompt[:30],
+                        objective=clean_prompt,
+                        status="pending",
+                        channel_id=message.channel.id,
+                        message_id=message.id,
+                        project_slug=clean_slug,
+                    )
+                    db.add(session)
+                    db.commit()
+                    db.refresh(session)
+                    session_id = session.id
+
+                    if clean_slug == "workspaceroot" or clean_slug == "workspace_root":
+                        proj_dir = get_projects_dir()
+                        display_name = "全体のワークスペース"
+                    else:
+                        proj_dir = get_projects_dir() / clean_slug
+                        proj_dir.mkdir(parents=True, exist_ok=True)
+                        display_name = clean_slug
+                        
+                    session.project_dir = str(proj_dir)
+                    db.commit()
+                finally:
+                    db.close()
+
+                await message.channel.send(f"プロジェクトディレクトリ `{display_name}` を作成/選択し、セッション #{session_id} を開始します！")
+
+                await enqueue_agent_with_dashboard(
+                    message.channel, session_id, clean_prompt, reply_msg_id=message.id, user_id=message.author.id
+                )
+                
+            else:
+                response_text = await ask_llm(clean_prompt)
+                await send_chunked_message(
+                    message.channel, response_text, reply_target=message
+                )
         return
 
     await bot.process_commands(message)
