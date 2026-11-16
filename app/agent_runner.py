@@ -9,53 +9,62 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from .db_models import Activity, GoalSession, Planner
+from .context_builder import ContextBuilder
+from .db_models import Activity, GoalSession, Planner, SessionMessage
 from .db_system import SessionLocal
 from .llama_acc import chat_with_tools
 from .prompts_and_schemas import AGENT_SYSTEM_PROMPT, AVAILABLE_TOOLS
 from .rag_store import rag_store
 from .secrets import (
-    get_keep_recent_messages,
-    get_max_history_messages,
     get_max_output_chars,
     get_max_steps,
     get_projects_dir,
-    get_workspace_dir,
     get_prompt_token_limit,
+    get_workspace_dir,
 )
 from .session_logger import (
     SessionFileLogger,
     StepLogRecord,
     ToolExecutionRecord,
 )
-from .token_monitor import estimate_messages_tokens, log_token_usage
+from .token_monitor import log_token_usage
 from .tools import execute_tool_async, init_git_repo, stop_docker_container
 
 INTERVENTION_QUEUES: dict[int, list[str]] = {}
 
 COMPLETION_KEYWORDS: tuple[str, ...] = ("完了", "finished", "complete")
 ERROR_INDICATORS: tuple[str, ...] = (
-    "error",
-    "exception",
-    "traceback",
-    "failed",
-    "permission denied",
-    "address already in use",
-    "not found",
-    "timed out",
+    "error", "exception", "traceback", "failed",
+    "permission denied", "address already in use", "not found", "timed out",
 )
 
 
 def add_session_intervention(session_id: int, message: str) -> None:
-    """実行中のセッションに対して次ステップで注入するユーザー指示を追加する．"""
     INTERVENTION_QUEUES.setdefault(session_id, []).append(message)
 
 
+def _pop_user_interventions(session_id: int) -> list[str]:
+    if not INTERVENTION_QUEUES.get(session_id):
+        return []
+    return INTERVENTION_QUEUES.pop(session_id)
+
+
+def _append_history(db: Session, session_id: int, step: int, msg: dict[str, Any], raw_history: list[dict[str, Any]]):
+    """メモリ上の履歴に追加しつつ、DBへも永続化する"""
+    raw_history.append(msg)
+    sm = SessionMessage(
+        session_id=session_id,
+        step=step,
+        role=msg.get("role", "unknown"),
+        message_json=json.dumps(msg, ensure_ascii=False)
+    )
+    db.add(sm)
+    db.commit()
+
+
 def extract_tool_call_from_text(content: str) -> dict[str, Any] | None:
-    """テキスト内の Markdown JSON コードブロックからツール呼び出しを救済抽出する．"""
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if not match:
-        return None
+    if not match: return None
     try:
         data = json.loads(match.group(1))
         if isinstance(data, dict) and "name" in data and "arguments" in data:
@@ -66,9 +75,7 @@ def extract_tool_call_from_text(content: str) -> dict[str, Any] | None:
 
 
 def parse_tool_arguments(raw_args: Any) -> dict[str, Any]:
-    """ツールの arguments を安全に dict としてパースする．"""
-    if isinstance(raw_args, dict):
-        return raw_args
+    if isinstance(raw_args, dict): return raw_args
     if isinstance(raw_args, str):
         try:
             parsed = json.loads(raw_args)
@@ -79,15 +86,8 @@ def parse_tool_arguments(raw_args: Any) -> dict[str, Any]:
 
 
 def build_handover_context(db: Session, session_id: int) -> str:
-    """コンテキスト圧縮時に挿入する最新の Planner 引き継ぎ情報を構築する．"""
-    latest_plan = (
-        db.query(Planner)
-        .filter(Planner.session_id == session_id)
-        .order_by(Planner.id.desc())
-        .first()
-    )
-    if not latest_plan:
-        return "No persistent planner history available."
+    latest_plan = db.query(Planner).filter(Planner.session_id == session_id).order_by(Planner.id.desc()).first()
+    if not latest_plan: return "No persistent planner history available."
 
     return (
         "--- [Project State Handover] ---\n"
@@ -111,80 +111,36 @@ def _prepare_session_workspace(session: GoalSession) -> Path:
     return project_path
 
 
-def _pop_user_interventions(
-    session_id: int, messages: list[dict[str, Any]]
-) -> list[str]:
-    """割り込みキューからメッセージを取り出してプロンプトへ注入し，注入リストを返す．"""
-    if not INTERVENTION_QUEUES.get(session_id):
-        return []
-    interventions = INTERVENTION_QUEUES.pop(session_id)
-    for inject_msg in interventions:
-        messages.append(
-            {
-                "role": "user",
-                "content": f"[User Mid-Course Correction / Note]: {inject_msg}",
-            }
-        )
-    return interventions
-
-
-def _compress_context_if_needed(
-    db: Session,
-    session: GoalSession,
-    messages: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], bool, str]:
-    """
-    上限超過時にコンテキスト圧縮を行い，(新messages, 圧縮発動フラグ, 引き継ぎノート) を返す．
-    """
-    max_history = get_max_history_messages()
-    prompt_limit = get_prompt_token_limit()
-    current_tokens = estimate_messages_tokens(messages, AVAILABLE_TOOLS)
-
-    if len(messages) <= max_history and current_tokens <= prompt_limit:
-        return messages, False, ""
-
-    keep_recent = get_keep_recent_messages()
-    handover_note = build_handover_context(db, session.id)
-    compressed_messages = [
-        messages[0],
-        {"role": "user", "content": f"Task Objective: {session.objective}"},
-        {"role": "system", "content": handover_note},
-        *messages[-keep_recent:],
-    ]
-    return compressed_messages, True, handover_note
-
-
 async def _inject_rag_hint_on_error(
     tool_output: str,
-    messages: list[dict[str, Any]],
+    raw_history: list[dict[str, Any]],
     injected_memory_ids: set[int],
-) -> list[str]:
-    """エラー出力検知時に RAG から解決ヒントを注入し，ヒットした知見ラベル一覧を返す．"""
+    db: Session,
+    session_id: int,
+    step: int
+) -> tuple[list[str], list[int]]:
     lower_out = tool_output.lower()
     if not any(indicator in lower_out for indicator in ERROR_INDICATORS):
-        return []
+        return [], []
 
     matched_memories = await rag_store.search_relevant_memories(tool_output)
     new_memories = [m for m in matched_memories if m.id not in injected_memory_ids]
     if not new_memories:
-        return []
+        return [], []
 
-    hit_labels: list[str] = []
+    hit_labels = []
+    used_ids = []
     for mem in new_memories:
         injected_memory_ids.add(mem.id)
+        used_ids.append(mem.id)
         hit_labels.append(f"[{mem.category}] (ID:{mem.id})")
 
-    rag_hint = rag_store.format_as_prompt_context(
-        new_memories, header="RAG Auto-Retrieved Troubleshooting Hint"
-    )
-    messages.append({"role": "system", "content": rag_hint})
-    return hit_labels
+    rag_hint = rag_store.format_as_prompt_context(new_memories, header="RAG Auto-Retrieved Troubleshooting Hint")
+    _append_history(db, session_id, step, {"role": "system", "content": rag_hint}, raw_history)
+    return hit_labels, used_ids
 
 
-async def _request_llm_with_metrics(
-    messages: list[dict[str, Any]], max_retries: int = 2
-) -> tuple[dict[str, Any], float, int]:
-    """LLM 推論を実行し，(response_msg, 推論秒数, リトライ回数) を返す．"""
+async def _request_llm_with_metrics(messages: list[dict[str, Any]], max_retries: int = 2) -> tuple[dict[str, Any], float, int]:
     start_t = time.perf_counter()
     for attempt in range(max_retries):
         try:
@@ -192,18 +148,9 @@ async def _request_llm_with_metrics(
             latency = time.perf_counter() - start_t
             return response_msg, latency, attempt
         except Exception as exc:
-            if attempt + 1 >= max_retries:
-                raise
+            if attempt + 1 >= max_retries: raise
             await asyncio.sleep(2)
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"Tool execution failed with server error ({exc}). "
-                        "Retry with concise parameters or split into smaller steps."
-                    ),
-                }
-            )
+            messages.append({"role": "user", "content": f"Tool execution failed with server error ({exc}). Retry."})
     raise RuntimeError("Unreachable retry state")
 
 
@@ -215,23 +162,15 @@ def _truncate_output(output: str) -> str:
 
 
 def _classify_tool_status(tool_output: str, is_repeat_blocked: bool) -> str:
-    if is_repeat_blocked:
-        return "BLOCKED_REPEAT"
+    if is_repeat_blocked: return "BLOCKED_REPEAT"
     lower = tool_output.lower()
-    if lower.startswith("error:") or any(k in lower for k in ERROR_INDICATORS):
-        return "ERROR"
+    if lower.startswith("error:") or any(k in lower for k in ERROR_INDICATORS): return "ERROR"
     return "SUCCESS"
 
 
-def _record_activity(
-    db: Session, session_id: int, tool_name: str, args: dict[str, Any], result: str
-) -> None:
+def _record_activity(db: Session, session_id: int, tool_name: str, args: dict[str, Any], result: str):
     args_summary = json.dumps(args, ensure_ascii=False)[:300]
-    activity = Activity(
-        session_id=session_id,
-        work=f"[{tool_name}] {args_summary}",
-        result=result[:500],
-    )
+    activity = Activity(session_id=session_id, work=f"[{tool_name}] {args_summary}", result=result[:500])
     db.add(activity)
     db.commit()
 
@@ -247,92 +186,61 @@ async def run_agent_loop(
 
     db = SessionLocal()
     session_logger: SessionFileLogger | None = None
-    final_result = (
-        f"Reached maximum allowed steps ({max_steps}) without calling finish_task."
-    )
+    final_result = f"Reached maximum allowed steps ({max_steps}) without calling finish_task."
+    used_rag_ids = set()
 
     try:
         session = db.query(GoalSession).filter(GoalSession.id == session_id).first()
-        if not session:
-            return "Session not found."
+        if not session: return "Session not found."
 
         project_path = _prepare_session_workspace(session)
         session.status = "running"
         db.commit()
 
-        # .log/session{session_id} ファイルロガーの初期化
-        session_logger = SessionFileLogger(
-            session_id=session_id,
-            title=session.title,
-            objective=session.objective,
-            workspace_dir=project_path,
-        )
+        session_logger = SessionFileLogger(session_id=session_id, title=session.title, objective=session.objective, workspace_dir=project_path)
+
+        # ▼ 1. DBから過去の履歴を全てロードし、再起動時の完全復元を行う
+        db_msgs = db.query(SessionMessage).filter(SessionMessage.session_id == session_id).order_by(SessionMessage.id).all()
+        raw_history = [json.loads(m.message_json) for m in db_msgs]
 
         initial_memories = await rag_store.search_relevant_memories(session.objective)
-        injected_memory_ids: set[int] = {m.id for m in initial_memories}
-        pending_rag_labels: list[str] = [
-            f"[{m.category}] (ID:{m.id})" for m in initial_memories
-        ]
-        rag_initial_block = rag_store.format_as_prompt_context(initial_memories)
-
-        system_content = (
-            f"{AGENT_SYSTEM_PROMPT}\n\n{rag_initial_block}"
-            if rag_initial_block
-            else AGENT_SYSTEM_PROMPT
-        )
-
-        # ---------------------------------------------------------
-        # ▼ 横断検索 (workspace_root) モード時のヒント注入
-        # ---------------------------------------------------------
+        injected_memory_ids = {m.id for m in initial_memories}
+        used_rag_ids.update(injected_memory_ids)
+        pending_rag_labels = [f"[{m.category}] (ID:{m.id})" for m in initial_memories]
+        
+        system_content = AGENT_SYSTEM_PROMPT
         if project_path == get_workspace_dir():
             try:
-                # ルート直下にあるディレクトリ一覧を取得
                 subdirs = [d for d in os.listdir(project_path) if os.path.isdir(project_path / d) and not d.startswith('.')]
                 if subdirs:
-                    dir_list = ", ".join(subdirs)
-                    system_content += (
-                        f"\n\n[Workspace Root Hint]: You are currently in the root workspace directory. "
-                        f"The following project directories exist here: {dir_list}. "
-                        f"Use 'list_files' or 'read_file' targeting these subdirectories to find past projects."
-                    )
+                    system_content += f"\n\n[Workspace Root Hint]: Directories here: {', '.join(subdirs)}."
             except Exception:
                 pass
-
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": f"Task Objective: {session.objective}"},
-        ]
 
         last_tool_signature: str | None = None
         repeat_count = 0
 
         for step in range(1, max_steps + 1):
-            interventions = _pop_user_interventions(session_id, messages)
-            messages, compressed, handover_text = _compress_context_if_needed(
-                db, session, messages
-            )
+            # ▼ 2. 割り込み指示を履歴に保存
+            for inv in _pop_user_interventions(session_id):
+                _append_history(db, session_id, step, {"role": "user", "content": f"[User Mid-Course Correction]: {inv}"}, raw_history)
+
+            # ▼ 3. ContextBuilder でトークン上限に合わせて賢く組み立てる
+            builder = ContextBuilder(get_prompt_token_limit())
+            builder.set_system(system_content)
+            builder.set_objective(session.objective)
+            builder.add_rag_or_plan(rag_store.format_as_prompt_context(initial_memories))
+            builder.add_rag_or_plan(build_handover_context(db, session.id))
+
+            prompt_messages, compressed, handover_text = builder.build_messages(raw_history)
 
             if dashboard_callback:
-                await dashboard_callback(
-                    step=step,
-                    max_steps=max_steps,
-                    status="Thinking (LLM推論中)...",
-                )
+                await dashboard_callback(step=step, max_steps=max_steps, status="Thinking (LLM推論中)...")
 
-            response_msg, latency_sec, retries = await _request_llm_with_metrics(
-                messages
-            )
+            response_msg, latency_sec, retries = await _request_llm_with_metrics(prompt_messages)
             actual_usage = response_msg.pop("_usage", None)
 
-            # コンソールへのトークン消費割合出力
-            log_token_usage(
-                step=step,
-                max_steps=max_steps,
-                session_id=session_id,
-                messages=messages,
-                tools=AVAILABLE_TOOLS,
-                actual_usage=actual_usage,
-            )
+            log_token_usage(step, max_steps, session_id, prompt_messages, AVAILABLE_TOOLS, actual_usage)
 
             content = (response_msg.get("content") or "").strip()
             tool_calls = response_msg.get("tool_calls")
@@ -342,168 +250,89 @@ async def run_agent_loop(
                 fallback_tool = extract_tool_call_from_text(content)
                 if fallback_tool:
                     dispatch_mode = "fallback_json"
-                    tool_calls = [
-                        {
-                            "id": f"fallback_call_{step}",
-                            "function": {
-                                "name": fallback_tool["name"],
-                                "arguments": json.dumps(fallback_tool["arguments"]),
-                            },
-                        }
-                    ]
+                    tool_calls = [{"id": f"fallback_call_{step}", "function": {"name": fallback_tool["name"], "arguments": json.dumps(fallback_tool["arguments"])}}]
 
-            # このステップのテレメトリレコードを作成
-            inference_telemetry = session_logger.build_inference_telemetry(
-                messages=messages,
-                tools=AVAILABLE_TOOLS,
-                actual_usage=actual_usage,
-                latency_sec=latency_sec,
-                retries=retries,
-                dispatch_mode=dispatch_mode,
-                thought_content=content,
-            )
-            step_record = StepLogRecord(
-                step=step,
-                max_steps=max_steps,
-                interventions=interventions,
-                context_compressed=compressed,
-                handover_snapshot=handover_text,
-                rag_injected_titles=list(pending_rag_labels),
-                inference=inference_telemetry,
-            )
+            inference_telemetry = session_logger.build_inference_telemetry(prompt_messages, AVAILABLE_TOOLS, actual_usage, latency_sec, retries, dispatch_mode, content)
+            step_record = StepLogRecord(step=step, max_steps=max_steps, context_compressed=compressed, handover_snapshot=handover_text, rag_injected_titles=list(pending_rag_labels), inference=inference_telemetry)
             pending_rag_labels.clear()
 
-            messages.append(response_msg)
+            # ▼ 4. アシスタントの返答を履歴とDBに保存
+            _append_history(db, session_id, step, response_msg, raw_history)
 
             if dashboard_callback:
-                await dashboard_callback(
-                    step=step,
-                    max_steps=max_steps,
-                    thought=content,
-                    status="Tool Dispatching...",
-                )
+                await dashboard_callback(step=step, max_steps=max_steps, thought=content, status="Tool Dispatching...")
 
-            # ツール呼び出しが存在しない場合
             if not tool_calls:
                 session_logger.log_step(step_record)
-
                 if content and any(k in content.lower() for k in COMPLETION_KEYWORDS):
                     final_result = content
                     session.status = "completed"
                     db.commit()
                     session_logger.log_session_summary("completed", final_result)
+                    rag_store.mark_memory_success(list(used_rag_ids), True)
                     return final_result
 
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Do not explain your steps in text. Directly invoke "
-                            "the appropriate tool using the function calling schema."
-                        ),
-                    }
-                )
+                _append_history(db, session_id, step, {"role": "user", "content": "Directly invoke tool using function calling schema."}, raw_history)
                 continue
 
-            # 各ツールの実行と計測
             finish_called = False
             for call in tool_calls:
                 tool_name = call["function"]["name"]
                 args = parse_tool_arguments(call["function"].get("arguments"))
-
-                current_signature = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
-                if current_signature == last_tool_signature:
+                current_sig = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
+                if current_sig == last_tool_signature:
                     repeat_count += 1
                 else:
-                    last_tool_signature = current_signature
+                    last_tool_signature = current_sig
                     repeat_count = 0
 
                 if dashboard_callback:
-                    await dashboard_callback(
-                        step=step,
-                        max_steps=max_steps,
-                        thought=content,
-                        tool_name=tool_name,
-                        tool_args=args,
-                        status=f"Executing {tool_name}...",
-                    )
+                    await dashboard_callback(step=step, max_steps=max_steps, thought=content, tool_name=tool_name, tool_args=args, status=f"Executing {tool_name}...")
 
                 tool_start_t = time.perf_counter()
                 is_repeat_blocked = repeat_count >= 1
 
                 if is_repeat_blocked:
-                    tool_output = (
-                        f"Error: Repetitive action detected for '{tool_name}'. "
-                        "Proceed to next verification step or call 'finish_task'."
-                    )
+                    tool_output = f"Error: Repetitive action detected for '{tool_name}'."
                 else:
-                    tool_output = await execute_tool_async(
-                        tool_name,
-                        args,
-                        session_id=session_id,
-                        project_dir=project_path,
-                        human_ask_callback=human_ask_callback,
-                    )
+                    tool_output = await execute_tool_async(tool_name, args, session_id=session_id, project_dir=project_path, human_ask_callback=human_ask_callback)
 
                 tool_duration = time.perf_counter() - tool_start_t
                 truncated_output = _truncate_output(tool_output)
                 tool_status = _classify_tool_status(tool_output, is_repeat_blocked)
 
-                # ステップログにツールの実行詳細と生出力を追加
-                step_record.tool_executions.append(
-                    ToolExecutionRecord(
-                        tool_name=tool_name,
-                        args=args,
-                        duration_sec=tool_duration,
-                        status=tool_status,
-                        raw_output=tool_output,
-                        sent_output_len=len(truncated_output),
-                    )
-                )
+                step_record.tool_executions.append(ToolExecutionRecord(tool_name=tool_name, args=args, duration_sec=tool_duration, status=tool_status, raw_output=tool_output, sent_output_len=len(truncated_output)))
 
                 if dashboard_callback:
-                    await dashboard_callback(
-                        step=step,
-                        max_steps=max_steps,
-                        thought=content,
-                        tool_name=tool_name,
-                        tool_args=args,
-                        tool_output=truncated_output,
-                        status="Step Completed",
-                    )
+                    await dashboard_callback(step=step, max_steps=max_steps, thought=content, tool_name=tool_name, tool_args=args, tool_output=truncated_output, status="Step Completed")
 
                 _record_activity(db, session_id, tool_name, args, truncated_output)
-
                 if tool_name == "finish_task":
                     final_result = tool_output
                     finish_called = True
 
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "name": tool_name,
-                        "content": truncated_output,
-                    }
-                )
+                # ▼ 5. ツールの結果を履歴とDBに保存
+                _append_history(db, session_id, step, {"role": "tool", "tool_call_id": call["id"], "name": tool_name, "content": truncated_output}, raw_history)
 
-                new_rag_hits = await _inject_rag_hint_on_error(
-                    truncated_output, messages, injected_memory_ids
-                )
-                pending_rag_labels.extend(new_rag_hits)
+                hits, mem_ids = await _inject_rag_hint_on_error(truncated_output, raw_history, injected_memory_ids, db, session_id, step)
+                pending_rag_labels.extend(hits)
+                used_rag_ids.update(mem_ids)
 
-            # 1ステップ分の全推論・ツール実行記録を .log/session{id} へフラッシュ
             session_logger.log_step(step_record)
 
             if finish_called:
                 session.status = "completed"
                 db.commit()
                 session_logger.log_session_summary("completed", final_result)
+                # ▼ 成功時: 使用したノウハウを評価＋１
+                rag_store.mark_memory_success(list(used_rag_ids), True)
                 return final_result
 
         session.status = "failed"
         db.commit()
         session_logger.log_session_summary("failed", final_result)
+        # ▼ 失敗時: 役に立たなかったノウハウとして評価－１
+        rag_store.mark_memory_success(list(used_rag_ids), False)
         return final_result
 
     except asyncio.CancelledError:
@@ -512,12 +341,8 @@ async def run_agent_loop(
         if session:
             session.status = "cancelled"
             db.commit()
-        if session_logger:
-            session_logger.log_session_summary(
-                "cancelled", "Session cancelled by user."
-            )
+        if session_logger: session_logger.log_session_summary("cancelled", "Session cancelled by user.")
         raise
-
     except Exception as exc:
         db.rollback()
         err_msg = f"Agent failed with error: {exc}"
@@ -525,10 +350,8 @@ async def run_agent_loop(
         if session:
             session.status = "failed"
             db.commit()
-        if session_logger:
-            session_logger.log_session_summary("failed", err_msg)
+        if session_logger: session_logger.log_session_summary("failed", err_msg)
         return err_msg
-
     finally:
         stop_docker_container(session_id)
         INTERVENTION_QUEUES.pop(session_id, None)

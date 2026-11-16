@@ -1,6 +1,14 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+)
 
 from .db_system import Base
 
@@ -58,6 +66,21 @@ class Planner(Base):
     datetime = Column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+# ▼ 新規追加: 会話履歴の完全永続化テーブル
+class SessionMessage(Base):
+    __tablename__ = "session_message"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("goalsession.id"), index=True)
+    step = Column(Integer, nullable=False, index=True)
+    
+    role = Column(String(32), nullable=False)
+    message_json = Column(Text, nullable=False)  # メッセージ（辞書）をまるごと保存
+    
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+
+
+# ▼ 更新: RAGの自己学習・評価カラムを追加
 class TroubleshootingMemory(Base):
     __tablename__ = "troubleshooting_memory"
 
@@ -66,6 +89,10 @@ class TroubleshootingMemory(Base):
     error_pattern = Column(Text, nullable=False)
     root_cause = Column(Text, nullable=False)
     solution = Column(Text, nullable=False)
-    # 生成された Embedding ベクトル（JSON 配列文字列）
     embedding_json = Column(Text, nullable=True)
+    
+    success_count = Column(Integer, default=0)
+    fail_count = Column(Integer, default=0)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
