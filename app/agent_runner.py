@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import time
 from collections.abc import Callable
@@ -19,6 +20,7 @@ from .secrets import (
     get_max_output_chars,
     get_max_steps,
     get_projects_dir,
+    get_workspace_dir,
     get_prompt_token_limit,
 )
 from .session_logger import (
@@ -280,12 +282,10 @@ async def run_agent_loop(
         )
 
         # ---------------------------------------------------------
-        # ▼ 追加: 横断検索 (workspace_root) モード時のヒント注入
+        # ▼ 横断検索 (workspace_root) モード時のヒント注入
         # ---------------------------------------------------------
-        from .secrets import get_projects_dir
-        if project_path == get_projects_dir():
+        if project_path == get_workspace_dir():
             try:
-                import os
                 # ルート直下にあるディレクトリ一覧を取得
                 subdirs = [d for d in os.listdir(project_path) if os.path.isdir(project_path / d) and not d.startswith('.')]
                 if subdirs:

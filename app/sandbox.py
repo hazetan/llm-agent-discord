@@ -286,31 +286,6 @@ class DockerSandboxManager:
             capture_output=True,
         )
 
-    # --- Docker SDK 未導入環境用の CLI フォールバック ---
-    def _ensure_container_cli(self, container_name: str, project_dir: Path) -> str:
-        check = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if check.returncode == 0 and "true" in check.stdout.lower():
-            return container_name
-
-        subprocess.run(["docker", "rm", "-f", container_name], check=False, capture_output=True)
-        cmd = [
-            "docker", "run", "-d",
-            "--name", container_name,
-            "-m", get_docker_mem_limit(),
-            "-v", f"{project_dir.resolve()}:/workspace",
-            "-w", "/workspace",
-            get_docker_image(),
-            "tail", "-f", "/dev/null",
-        ]
-        res = subprocess.run(cmd, check=False, capture_output=True, text=True)
-        if res.returncode != 0:
-            raise RuntimeError(f"Docker container start failed: {res.stderr}")
-        return container_name
 
     def _execute_command_cli(
         self, container_name: str, workspace_dir: Path, command: str, timeout_sec: int

@@ -5,6 +5,7 @@ AGENT_SYSTEM_PROMPT = (
     "Environment constraints:\n"
     "- All command executions strictly run in Docker container (/workspace).\n"
     "- CRITICAL: If you are provided with existing code or placed in a pre-existing workspace, your VERY FIRST step MUST be to use 'list_files' to understand the directory structure, and 'read_file' to inspect the contents of key files. Do not guess the structure or overwrite files blindly.\n"
+    "- CORE DIRECTIVE (PERSISTENT MEMORY): You MUST use a `README.md` file in the project root to store all crucial contexts, initial requirements, architecture rules, and current progress. Always read it first when continuing a project, and diligently update it whenever requirements change. This guarantees you never forget the initial plan across sessions.\n"
     "- Before starting complex operations, use 'record_plan' to document issue and tasks.\n"
     "- Use 'list_files' to inspect directory and 'read_file' to view code.\n"
     "- For modifying existing files, PREFER 'replace_in_file' for small edits or 'write_file' for whole files.\n"

@@ -80,40 +80,67 @@ class ContinuePromptModal(discord.ui.Modal, title="プロンプトを追加し�
         )
 
 
+class InjectPromptModal(discord.ui.Modal, title="実行中のエージェントに割り込み指示"):
+    prompt_input = discord.ui.TextInput(
+        label="指示や修正要望",
+        style=discord.TextStyle.paragraph,
+        placeholder="例: 「〇〇のファイルを確認して」「その方針はやめて〇〇にして」",
+        required=True
+    )
+
+    def __init__(self, session_id: int):
+        super().__init__()
+        self.session_id = session_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        prompt_text = self.prompt_input.value
+
+        with get_db_session() as db:
+            session = db.query(GoalSession).filter(GoalSession.id == self.session_id).first()
+            if not session:
+                await interaction.response.send_message("セッションが見つかりません．", ephemeral=True)
+                return
+            
+            # 実行中・待機中かどうかのチェック
+            if session.status not in ["running", "pending"]:
+                await interaction.response.send_message(
+                    "このセッションは実行中ではないため割り込めません。「指示を追加して続行」を使用してください。", 
+                    ephemeral=True
+                )
+                return
+
+        # 割り込み指示をキューに追加
+        add_session_intervention(self.session_id, prompt_text)
+
+        await interaction.response.send_message(
+            f"セッション #{self.session_id} の次ステップへ指示を割り込ませました: `{prompt_text}`", 
+            ephemeral=True
+        )
+
+
 class AgentDashboardView(discord.ui.View):
     def __init__(self, session_id: int, project_dir: Path):
         super().__init__(timeout=None)
         self.session_id = session_id
         self.project_dir = project_dir
 
+    # ▼ 【1段目】実行中・待機中に使うボタン
     @discord.ui.button(
-        label="中断", style=discord.ButtonStyle.danger, custom_id="btn_stop"
+        label="中断", style=discord.ButtonStyle.danger, custom_id="btn_stop", row=0
     )
-    async def stop_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if agent_task_queue.cancel_session(self.session_id):
-            await interaction.response.send_message(
-                f"セッション #{self.session_id} に中断シグナルを送信しました．",
-                ephemeral=True,
-            )
+            await interaction.response.send_message(f"セッション #{self.session_id} に中断シグナルを送信しました．", ephemeral=True)
         else:
-            await interaction.response.send_message(
-                "既に完了しているか実行中ではありません．", ephemeral=True
-            )
+            await interaction.response.send_message("既に完了しているか実行中ではありません．", ephemeral=True)
 
     @discord.ui.button(
-        label="ファイル一覧",
-        style=discord.ButtonStyle.secondary,
-        custom_id="btn_files",
+        label="成果物プレビュー", style=discord.ButtonStyle.secondary, custom_id="btn_files", row=0
     )
-    async def list_files_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    async def list_files_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # （中略: 既存のコードをそのまま配置）
         if not self.project_dir.exists():
-            await interaction.response.send_message(
-                "プロジェクトディレクトリが存在しません．", ephemeral=True
-            )
+            await interaction.response.send_message("プロジェクトディレクトリが存在しません．", ephemeral=True)
             return
 
         lines = []
@@ -124,27 +151,16 @@ class AgentDashboardView(discord.ui.View):
             for f in files:
                 lines.append(f"• {prefix}{f}")
 
-        msg = (
-            "**現在のワークスペースファイル:**\n" + "\n".join(lines[:30])
-            if lines
-            else "(空のワークスペース)"
-        )
-        await interaction.response.send_message(
-            msg[:MAX_DISCORD_MSG_LEN], ephemeral=True
-        )
+        msg = "**現在のワークスペースファイル:**\n" + "\n".join(lines[:30]) if lines else "(空のワークスペース)"
+        await interaction.response.send_message(msg[:MAX_DISCORD_MSG_LEN], ephemeral=True)
 
     @discord.ui.button(
-        label="ZIP出力",
-        style=discord.ButtonStyle.primary,
-        custom_id="btn_zip",
+        label="ZIP出力", style=discord.ButtonStyle.primary, custom_id="btn_zip", row=0
     )
-    async def zip_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    async def zip_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # （中略: 既存のコードをそのまま配置）
         if not self.project_dir.exists():
-            await interaction.response.send_message(
-                "プロジェクトディレクトリが存在しません．", ephemeral=True
-            )
+            await interaction.response.send_message("プロジェクトディレクトリが存在しません．", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -163,19 +179,34 @@ class AgentDashboardView(discord.ui.View):
                 ephemeral=True,
             )
         else:
-            await interaction.followup.send(
-                content="ZIPが25MBを超えているため送信できませんでした．",
-                ephemeral=True,
-            )
+            await interaction.followup.send(content="ZIPが25MBを超えているため送信できませんでした．", ephemeral=True)
 
+    # ▼ 新規追加: 「割り込み指示」ボタン
     @discord.ui.button(
-        label="とにかく続行", style=discord.ButtonStyle.success, custom_id="btn_continue"
+        label="割り込み指示", style=discord.ButtonStyle.success, custom_id="btn_inject", row=0
     )
-    async def continue_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        from .agent_runner import add_session_intervention
+    async def inject_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        with get_db_session() as db:
+            session = db.query(GoalSession).filter(GoalSession.id == self.session_id).first()
+            if not session:
+                await interaction.response.send_message("セッションが見つかりません．", ephemeral=True)
+                return
+            
+            if session.status not in ["running", "pending"]:
+                await interaction.response.send_message(
+                    "実行中ではないため割り込めません。「指示を追加して続行」を使用してください。", 
+                    ephemeral=True
+                )
+                return
 
+        await interaction.response.send_modal(InjectPromptModal(self.session_id))
+
+    # ▼ 【2段目】タスクが停止した後に「続きをやらせる」ボタン
+    @discord.ui.button(
+        label="とにかく続行", style=discord.ButtonStyle.success, custom_id="btn_continue", row=1
+    )
+    async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # （既存のコードをそのまま配置）
         with get_db_session() as db:
             session = db.query(GoalSession).filter(GoalSession.id == self.session_id).first()
             if not session:
@@ -183,9 +214,7 @@ class AgentDashboardView(discord.ui.View):
                 return
             
             if session.status in ["running", "pending"]:
-                await interaction.response.send_message(
-                    "このセッションは現在実行中または待機中です．", ephemeral=True
-                )
+                await interaction.response.send_message("このセッションは現在実行中または待機中です．", ephemeral=True)
                 return
             
             session.status = "pending"
@@ -197,22 +226,14 @@ class AgentDashboardView(discord.ui.View):
             "ユーザーからの指示: 先ほどの報告ではプロジェクトが完全に完成していませんでした。不足している機能の実装、エラーの修正、および完全な動作確認を続行してください。"
         )
 
-        await interaction.response.send_message(
-            f"セッション #{self.session_id} の作業を再開し，タスクキューへ再投入しました．", 
-            ephemeral=True
-        )
-
-        asyncio.create_task(
-            enqueue_agent_with_dashboard(interaction.channel, self.session_id, objective)
-        )
+        await interaction.response.send_message(f"セッション #{self.session_id} の作業を再開し，タスクキューへ再投入しました．", ephemeral=True)
+        asyncio.create_task(enqueue_agent_with_dashboard(interaction.channel, self.session_id, objective))
     
     @discord.ui.button(
-        label="指示を追加して続行", style=discord.ButtonStyle.primary, custom_id="btn_continue_with_prompt"
+        label="指示を追加して続行", style=discord.ButtonStyle.primary, custom_id="btn_continue_with_prompt", row=1
     )
-    async def continue_with_prompt_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        
+    async def continue_with_prompt_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # （既存のコードをそのまま配置）
         with get_db_session() as db:
             session = db.query(GoalSession).filter(GoalSession.id == self.session_id).first()
             if not session:
@@ -220,9 +241,7 @@ class AgentDashboardView(discord.ui.View):
                 return
             
             if session.status in ["running", "pending"]:
-                await interaction.response.send_message(
-                    "このセッションは現在実行中または待機中です．", ephemeral=True
-                )
+                await interaction.response.send_message("このセッションは現在実行中または待機中です．", ephemeral=True)
                 return
 
         await interaction.response.send_modal(ContinuePromptModal(self.session_id))

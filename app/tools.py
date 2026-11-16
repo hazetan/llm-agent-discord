@@ -1,3 +1,4 @@
+import asyncio
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -167,7 +168,7 @@ def _tool_list_files(args: dict[str, Any], workspace_dir: Path, _: int | None) -
     return "\n".join(tree_lines) if tree_lines else "(directory is empty)"
 
 
-def _tool_run_command(args: dict[str, Any], session_id: int, project_dir: Path) -> str:
+def _tool_run_command(args: dict[str, Any], project_dir: Path, session_id: int | None) -> str:
     command = args.get("command", "").strip()
     if not command:
         return "Error: Command is empty."
@@ -301,4 +302,4 @@ async def execute_tool_async(
     if not handler:
         return f"Error: Unknown tool {name}"
 
-    return handler(safe_args, workspace_dir, session_id)
+    return await asyncio.to_thread(handler, safe_args, workspace_dir, session_id)

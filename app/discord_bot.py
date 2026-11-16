@@ -1,4 +1,3 @@
-import asyncio
 import re
 import shutil
 from datetime import UTC, timedelta, timezone
@@ -196,7 +195,6 @@ async def start_from_task(ctx: commands.Context, source_dir_name: str, *, object
     slug_prompt = (
         "次のタスク目標から、プロジェクトを保存するための適切なディレクトリ名を1つだけ出力してください。\n"
         "条件: 英小文字、数字、アンダースコア(_)のみを使用し、空白や他の記号は含めないこと。説明文は一切不要です。\n"
-        "※ただし、タスクが「全体を検索する」「既存の全プロジェクトを調べる」といった内容で、特定のプロジェクトに隔離しない方が良い場合は、特殊キーワード 'workspace_root' と出力してください。\n"
         f"例: shogi_gui, web_server, react_todo_app, workspace_root\n"
         f"タスク目標: {objective}"
     )
@@ -312,17 +310,47 @@ async def on_message(message: discord.Message) -> None:
             return
 
         async with message.channel.typing():
-            # ▼ 修正：意図判定と受領メッセージを同時に作らせる JSON プロンプト
+            # ▼ 1. チャット履歴の取得（直近10件）
+            history_text = ""
+            try:
+                hist_msgs = [m async for m in message.channel.history(limit=10, before=message)]
+                hist_msgs.reverse()  # 古い順に並び替え
+                lines = []
+                for m in hist_msgs:
+                    author_name = "Bot" if m.author == bot.user else m.author.display_name
+                    text = m.clean_content
+                    # Embed（ダッシュボード等）の内容も拾う
+                    if not text and m.embeds:
+                        text = (m.embeds[0].title or "") + " " + (m.embeds[0].description or "")
+                    
+                    text = text.strip().replace("\n", " ")
+                    if not text:
+                        continue
+                        
+                    # 長すぎるログは切り詰め
+                    if len(text) > 400:
+                        text = text[:400] + "..."
+                    lines.append(f"[{author_name}]: {text}")
+                history_text = "\n".join(lines)
+            except Exception:
+                pass
+            
+            context_str = f"【直近のチャット履歴】\n{history_text}\n\n" if history_text else ""
+
+            # ▼ 2. 履歴を踏まえた意図判定プロンプト
             intent_prompt = (
                 "以下のユーザーの発言が、「単なる雑談や簡単な質問」か、"
                 "それとも「コードの作成、ファイルの編集、コマンドの実行など、"
-                "ワークスペース上での何らかの作業依頼」かを判定してください。\n\n"
+                "ワークスペース上での何らかの作業依頼」かを判定してください。\n"
+                "直近のチャット履歴も参考にし、もし「続きをやって」「あれを修正して」のような指示があれば、"
+                "チャット履歴からその作業内容を推測して作業依頼（TASK）とみなしてください。\n\n"
                 "必ず以下の JSON 形式で出力してください。Markdown のコードブロック(```json ... ```)は不要です。\n"
                 "{\n"
                 '  "intent": "TASK または CHAT",\n'
-                '  "reply": "TASKの場合: 作業を引き受ける際の、頼もしいアシスタントとしての自然な日本語の返事（例: 了解しました！〇〇の機能ですね。さっそくプロジェクトを立ち上げて開発を開始します！）。CHATの場合: 空文字"\n'
+                '  "reply": "TASKの場合: 作業を引き受ける際の、頼もしいアシスタントとしての自然な日本語の返事（例: 了解しました！〇〇の機能ですね。さっそく開発を開始します！）。CHATの場合: 空文字"\n'
                 "}\n\n"
-                f"ユーザーの発言: {clean_prompt}"
+                f"{context_str}"
+                f"【今回のユーザーの発言】: {clean_prompt}"
             )
             
             intent_result = await ask_llm(intent_prompt)
@@ -332,26 +360,40 @@ async def on_message(message: discord.Message) -> None:
             reply_text = "作業を開始します。"
             try:
                 import json
-                # Markdown ブロックがあれば除去
                 clean_json_str = re.sub(r"```(?:json)?\s*(.*?)\s*```", r"\1", intent_result, flags=re.DOTALL).strip()
                 data = json.loads(clean_json_str)
                 intent = data.get("intent", "CHAT").strip().upper()
                 reply_text = data.get("reply", "了解しました。作業用のエージェント環境を準備しますね！")
             except Exception:
-                # パース失敗時のフォールバック
                 if "TASK" in intent_result.upper():
                     intent = "TASK"
 
             if "TASK" in intent:
-                # ▼ 修正：機械的な定型文ではなく、LLMが考えた自然な返事を使う
-                await message.reply(f"🚀 {reply_text}")
+                await message.reply(f"{reply_text}")
                 
+                # ▼ 3. 抽象的な指示を具体的なタスク目標(Objective)に翻訳する
+                objective_prompt = (
+                    "以下の直近のチャット履歴とユーザーの今回の発言から、AIエージェントに渡すための『実行すべき具体的なタスク目標』を1文で生成してください。\n"
+                    "「続きをやって」「さっきの件」といった代名詞や抽象的な表現は、履歴を元に具体的なプロジェクト名・機能名・要件に置き換えてください。\n"
+                    "※重要1: どんな場合でも【必ず自然な日本語で】出力してください。\n"
+                    "※重要2: 履歴内の「default_project」やエラーメッセージなどの、システム側の都合の文言は目標に含めず、ユーザーが本当にやりたい目的を抽出してください。\n"
+                    "※今回の発言がすでに十分に具体的であれば、それをそのまま整えて出力してください。\n"
+                    "※出力は目標の1文のみとし、説明は一切不要です。\n\n"
+                    f"{context_str}"
+                    f"【今回のユーザーの発言】: {clean_prompt}"
+                )
+                refined_objective = await ask_llm(objective_prompt)
+                refined_objective = refined_objective.strip()
+                if not refined_objective:
+                    refined_objective = clean_prompt
+
+                # ▼ 4. 翻訳された具体的な目標を使ってプロジェクト名を決定
                 slug_prompt = (
                     "次のタスク目標から、プロジェクトを保存するための適切なディレクトリ名を1つだけ出力してください。\n"
                     "条件: 英小文字、数字、アンダースコア(_)のみを使用し、空白や他の記号は含めないこと。説明文は一切不要です。\n"
-                    "※ただし、タスクが「全体を検索する」「既存の全プロジェクトを調べる」といった内容で、特定のプロジェクトに隔離しない方が良い場合は、特殊キーワード 'workspace_root' と出力してください。\n"
+                    "※重要: もしタスクが「全体を検索する」「既存のプロジェクトを調べる」「workspaceを調査する」など、特定のプロジェクトへの隔離が不要（または不適切）な内容であれば、必ず特殊キーワード 'workspace_root' と出力してください。\n"
                     f"例: shogi_gui, web_server, react_todo_app, workspace_root\n"
-                    f"タスク目標: {clean_prompt}"
+                    f"タスク目標: {refined_objective}"  # ← refined_objectiveを使用
                 )
                 
                 slug_result = await ask_llm(slug_prompt)
@@ -363,8 +405,8 @@ async def on_message(message: discord.Message) -> None:
                 db = SessionLocal()
                 try:
                     session = GoalSession(
-                        title=clean_prompt[:30],
-                        objective=clean_prompt,
+                        title=refined_objective[:30],
+                        objective=refined_objective,  # ← refined_objectiveを使用
                         status="pending",
                         channel_id=message.channel.id,
                         message_id=message.id,
@@ -376,7 +418,7 @@ async def on_message(message: discord.Message) -> None:
                     session_id = session.id
 
                     if clean_slug == "workspaceroot" or clean_slug == "workspace_root":
-                        proj_dir = get_projects_dir()
+                        proj_dir = get_workspace_dir()
                         display_name = "全体のワークスペース"
                     else:
                         proj_dir = get_projects_dir() / clean_slug
@@ -391,11 +433,17 @@ async def on_message(message: discord.Message) -> None:
                 await message.channel.send(f"プロジェクトディレクトリ `{display_name}` を作成/選択し、セッション #{session_id} を開始します！")
 
                 await enqueue_agent_with_dashboard(
-                    message.channel, session_id, clean_prompt, reply_msg_id=message.id, user_id=message.author.id
+                    message.channel, session_id, refined_objective, reply_msg_id=message.id, user_id=message.author.id
                 )
                 
             else:
-                response_text = await ask_llm(clean_prompt)
+                # ▼ CHAT（雑談）の場合も文脈を踏まえて返答させる
+                chat_prompt = (
+                    "あなたは優秀なプログラミングアシスタントです。以下のチャット履歴を踏まえて、ユーザーの発言に自然に返答してください。\n\n"
+                    f"{context_str}"
+                    f"【ユーザーの発言】: {clean_prompt}"
+                )
+                response_text = await ask_llm(chat_prompt)
                 await send_chunked_message(
                     message.channel, response_text, reply_target=message
                 )
