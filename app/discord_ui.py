@@ -255,7 +255,16 @@ async def enqueue_agent_with_dashboard(
     user_id: int | None = None,
 ) -> None:
     """ダッシュボードを作成し，非同期タスクキューへエージェントジョブを登録する．"""
-    project_dir = get_projects_dir() / f"session_{session_id}"
+    
+    # 修正: セッションDBから正しいプロジェクトディレクトリ(project_dir)を取得する
+    with get_db_session() as db:
+        session = db.query(GoalSession).filter(GoalSession.id == session_id).first()
+        if session and session.project_dir:
+            project_dir_str = session.project_dir
+        else:
+            project_dir_str = str(get_projects_dir() / f"session_{session_id}")
+            
+    project_dir = Path(project_dir_str)
     view = AgentDashboardView(session_id, project_dir)
 
     # ---------------------------------------------------------
@@ -267,7 +276,7 @@ async def enqueue_agent_with_dashboard(
 
     embed = discord.Embed(
         title=f"Project Runner - Session #{session_id}",
-        description=f"**目標**: {objective}\n{WIDTH_SPACER}", # ▼ Descriptionの末尾にスペーサーを配置
+        description=f"**目標**: {objective}\n{WIDTH_SPACER}",
         color=discord.Color.blue(),
         timestamp=datetime.now(UTC),
     )
