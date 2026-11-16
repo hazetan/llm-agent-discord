@@ -169,7 +169,7 @@ def get_workspace_dir() -> Path:
     if custom_ws:
         workspace_path = Path(custom_ws).expanduser().resolve()
     else:
-        workspace_path = (Path.home() / "discord-bot" / "workspace").resolve()
+        workspace_path = (Path.home() / "discord_bot" / "workspace").resolve()
 
     workspace_path.mkdir(parents=True, exist_ok=True)
     return workspace_path
