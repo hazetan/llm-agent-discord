@@ -203,7 +203,7 @@ class AgentDashboardView(discord.ui.View):
 
     # ▼ 【2段目】タスクが停止した後に「続きをやらせる」ボタン
     @discord.ui.button(
-        label="とにかく続行", style=discord.ButtonStyle.success, custom_id="btn_continue", row=1
+        label="指示なし再ループ", style=discord.ButtonStyle.success, custom_id="btn_continue", row=1
     )
     async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         # （既存のコードをそのまま配置）
@@ -230,7 +230,7 @@ class AgentDashboardView(discord.ui.View):
         asyncio.create_task(enqueue_agent_with_dashboard(interaction.channel, self.session_id, objective))
     
     @discord.ui.button(
-        label="指示を追加して続行", style=discord.ButtonStyle.primary, custom_id="btn_continue_with_prompt", row=1
+        label="指示を追加して再ループ", style=discord.ButtonStyle.primary, custom_id="btn_continue_with_prompt", row=1
     )
     async def continue_with_prompt_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         # （既存のコードをそのまま配置）
