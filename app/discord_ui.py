@@ -8,7 +8,7 @@ from typing import Any
 
 import discord
 
-from .agent_runner import run_agent_loop
+from .agent_runner import add_session_intervention, run_agent_loop
 from .db_models import GoalSession
 from .db_system import get_db_session
 from .sandbox import IGNORE_PATTERNS, package_project_to_zip
@@ -36,6 +36,58 @@ async def send_chunked_message(
             await channel.send(chunk)
 
 
+class ContinuePromptModal(discord.ui.Modal, title="プロンプトを追加して続行"):
+    prompt_input = discord.ui.TextInput(
+        label="追加の指示や修正要望",
+        style=discord.TextStyle.paragraph,
+        placeholder="例: 「〇〇の機能も追加して」「文字色を赤にして」",
+        required=True
+    )
+
+    def __init__(self, session_id: int):
+        super().__init__()
+        self.session_id = session_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        # 既存の enqueue_agent_with_dashboard 関数が同一ファイル内にある前提
+        # 別ファイルにある場合は from .xxx import enqueue_agent_with_dashboard のようにインポートしてください
+
+        prompt_text = self.prompt_input.value
+
+        with get_db_session() as db:
+            session = db.query(GoalSession).filter(GoalSession.id == self.session_id).first()
+            if not session:
+                await interaction.response.send_message("セッションが見つかりません．", ephemeral=True)
+                return
+            
+            # 再開可能なステータスかチェック
+            if session.status in ["running", "pending"]:
+                await interaction.response.send_message("実行中・待機中のため再開できません．", ephemeral=True)
+                return
+                
+            # ステータスを待機中に戻す
+            session.status = "pending"
+            objective = session.objective
+            db.commit()
+
+        # エージェントへの割り込み指示（追加プロンプト）を注入
+        add_session_intervention(
+            self.session_id, 
+            f"ユーザーからの追加指示・修正要望: {prompt_text}\nこの指示に従って作業を続行し、完全に動作することを確認してから完了してください。"
+        )
+
+        await interaction.response.send_message(
+            f"セッション #{self.session_id} に追加指示を送り，作業を再開しました．", 
+            ephemeral=True
+        )
+
+        # タスクキューへ再投入してダッシュボードを再生成
+        asyncio.create_task(
+            enqueue_agent_with_dashboard(interaction.channel, self.session_id, objective)
+        )
+
+
 class AgentDashboardView(discord.ui.View):
     def __init__(self, session_id: int, project_dir: Path):
         super().__init__(timeout=None)
@@ -43,14 +95,14 @@ class AgentDashboardView(discord.ui.View):
         self.project_dir = project_dir
 
     @discord.ui.button(
-        label="🛑 中断", style=discord.ButtonStyle.danger, custom_id="btn_stop"
+        label="中断", style=discord.ButtonStyle.danger, custom_id="btn_stop"
     )
     async def stop_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         if agent_task_queue.cancel_session(self.session_id):
             await interaction.response.send_message(
-                f"🛑 セッション #{self.session_id} に中断シグナルを送信しました．",
+                f"セッション #{self.session_id} に中断シグナルを送信しました．",
                 ephemeral=True,
             )
         else:
@@ -59,7 +111,7 @@ class AgentDashboardView(discord.ui.View):
             )
 
     @discord.ui.button(
-        label="📄 ファイル一覧",
+        label="ファイル一覧",
         style=discord.ButtonStyle.secondary,
         custom_id="btn_files",
     )
@@ -90,7 +142,7 @@ class AgentDashboardView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="📦 今すぐZIP出力",
+        label="今すぐZIP出力",
         style=discord.ButtonStyle.primary,
         custom_id="btn_zip",
     )
@@ -107,7 +159,7 @@ class AgentDashboardView(discord.ui.View):
         zip_path = package_project_to_zip(self.project_dir, self.session_id)
         if zip_path.stat().st_size < MAX_ZIP_BYTES:
             await interaction.followup.send(
-                content=f"📦 セッション #{self.session_id} 現時点のスナップショット:",
+                content=f"セッション #{self.session_id} 現時点のスナップショット:",
                 file=discord.File(str(zip_path)),
                 ephemeral=True,
             )
@@ -118,7 +170,7 @@ class AgentDashboardView(discord.ui.View):
             )
 
     @discord.ui.button(
-        label="▶️ 続行", style=discord.ButtonStyle.success, custom_id="btn_continue"
+        label="とにかく続行", style=discord.ButtonStyle.success, custom_id="btn_continue"
     )
     async def continue_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -150,7 +202,7 @@ class AgentDashboardView(discord.ui.View):
         )
 
         await interaction.response.send_message(
-            f"▶️ セッション #{self.session_id} の作業を再開し，タスクキューへ再投入しました．", 
+            f"セッション #{self.session_id} の作業を再開し，タスクキューへ再投入しました．", 
             ephemeral=True
         )
 
@@ -172,7 +224,7 @@ async def enqueue_agent_with_dashboard(
     view = AgentDashboardView(session_id, project_dir)
 
     embed = discord.Embed(
-        title=f"🚀 Project Runner - Session #{session_id}",
+        title=f"Project Runner - Session #{session_id}",
         description=f"**目標**: {objective}",
         color=discord.Color.blue(),
         timestamp=datetime.now(UTC),
@@ -188,7 +240,7 @@ async def enqueue_agent_with_dashboard(
         embed.set_field_at(
             0,
             name="進捗",
-            value=f"⏳ **キュー待機中 (Waiting in Queue: #{position})**",
+            value=f"**キュー待機中 (Waiting in Queue: #{position})**",
             inline=False,
         )
         try:
@@ -226,13 +278,13 @@ async def enqueue_agent_with_dashboard(
             if len(arg_str) > 100:
                 arg_str = arg_str[:100] + "..."
             action_parts.append(
-                f"⚙️ **ツール**: `{tool_name}`\n```json\n{arg_str}\n```"
+                f"**ツール**: `{tool_name}`\n```json\n{arg_str}\n```"
             )
         if tool_output:
             out_preview = (
                 tool_output[:300] + "..." if len(tool_output) > 300 else tool_output
             )
-            action_parts.append(f"📥 **出力**:\n```text\n{out_preview}\n```")
+            action_parts.append(f"**出力**:\n```text\n{out_preview}\n```")
 
         if action_parts:
             embed.set_field_at(
@@ -247,7 +299,7 @@ async def enqueue_agent_with_dashboard(
 
     async def human_ask_listener(question: str) -> str:
         prompt_text = (
-            f"🙋‍♂️ **[エージェントからの質問] (Session #{session_id})**\n"
+            f"**[エージェントからの質問] (Session #{session_id})**\n"
             f"> {question}\n\n"
             f"返答するにはこのチャンネルで `./tell {question[:15]}...` または直接返信してください．"
         )
@@ -289,21 +341,21 @@ async def enqueue_agent_with_dashboard(
 
                     if zip_path.stat().st_size < MAX_ZIP_BYTES:
                         await channel.send(
-                            content=f"📦 **[成果物ZIP]** セッション #{session_id} の完成パッケージです．",
+                            content=f"**[成果物ZIP]** セッション #{session_id} の完成パッケージです．",
                             file=discord.File(str(zip_path)),
                         )
 
         except asyncio.CancelledError:
             embed.color = discord.Color.red()
             embed.set_field_at(
-                0, name="進捗", value="🛑 **中断されました (Cancelled)**", inline=False
+                0, name="進捗", value="**中断されました (Cancelled)**", inline=False
             )
             try:
                 await dashboard_msg.edit(embed=embed, view=view)
             except Exception:
                 pass
             await channel.send(
-                f"🛑 **[Session #{session_id}]** ユーザーの指示によりタスクを中断しました．"
+                f"**[Session #{session_id}]** ユーザーの指示によりタスクを中断しました．"
             )
             raise
 

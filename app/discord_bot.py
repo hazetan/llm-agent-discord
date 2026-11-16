@@ -20,7 +20,7 @@ JST = timezone(timedelta(hours=9))
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="./", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 async def _resolve_channel(channel_id: int) -> discord.abc.Messageable | None:
@@ -66,8 +66,8 @@ async def on_ready() -> None:
             )
 
 
-@bot.command(name="start")
-async def start_task(ctx: commands.Context, *, objective: str) -> None:
+@bot.command(name="run")
+async def run_task(ctx: commands.Context, *, objective: str) -> None:
     """新規自律エージェントセッションを作成し，非同期タスクキューへ投入する．"""
     with get_db_session() as db:
         session = GoalSession(

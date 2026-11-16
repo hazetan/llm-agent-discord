@@ -4,7 +4,7 @@ log/
 .database/
 llm_models
 llama_cpp
-
+workspace
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
