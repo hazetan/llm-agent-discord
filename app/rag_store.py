@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import re
+from dataclasses import dataclass
 
 import aiohttp
 
@@ -13,7 +14,6 @@ LOCAL_VEC_DIM = 256
 
 
 def _normalize_vector(vec: list[float]) -> list[float]:
-    """ベクトルを L2 正規化する．"""
     norm = math.sqrt(sum(v * v for v in vec))
     if norm < 1e-12:
         return vec
@@ -21,10 +21,6 @@ def _normalize_vector(vec: list[float]) -> list[float]:
 
 
 def _compute_local_hash_embedding(text: str, dim: int = LOCAL_VEC_DIM) -> list[float]:
-    """
-    Embedding API が利用できない環境向けの軽量ローカル特徴量ベクトル生成（Feature Hashing）．
-    単語トークンと文字 bi-gram/tri-gram を組み合わせて日英混在のエラー文を高精度にベクトル化する．
-    """
     cleaned = re.sub(r"\s+", " ", text.lower()).strip()
     if not cleaned:
         return [0.0] * dim
@@ -45,17 +41,43 @@ def _compute_local_hash_embedding(text: str, dim: int = LOCAL_VEC_DIM) -> list[f
 
 
 def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
-    """2つの正規化済みベクトルのコサイン類似度を算出する（次元数が異なる場合は 0.0）．"""
     if not vec_a or not vec_b or len(vec_a) != len(vec_b):
         return 0.0
     return sum(a * b for a, b in zip(vec_a, vec_b))
 
 
+@dataclass
+class MemoryVectorCache:
+    id: int
+    vector: list[float]
+    success_score: float
+
+
 class TroubleshootingRAGStore:
-    """トラブルシューティング知識のベクトル化・保存・類似検索を担う RAG ストア．"""
+    """インメモリキャッシュとハイブリッド検索（実績ボーナス）を備えた次世代RAGストア"""
+
+    def __init__(self):
+        self._vector_cache: list[MemoryVectorCache] = []
+        self._is_loaded = False
+
+    def _load_cache_if_needed(self, db) -> None:
+        if self._is_loaded:
+            return
+        self._vector_cache.clear()
+        records = db.query(TroubleshootingMemory).all()
+        for rec in records:
+            if not rec.embedding_json:
+                continue
+            try:
+                vec = json.loads(rec.embedding_json)
+                total_uses = rec.success_count + rec.fail_count
+                trust_bonus = 1.0 + (0.1 * rec.success_count) if total_uses > 0 else 1.0
+                self._vector_cache.append(MemoryVectorCache(id=rec.id, vector=vec, success_score=trust_bonus))
+            except Exception:
+                pass
+        self._is_loaded = True
 
     async def get_embedding(self, text: str) -> list[float]:
-        """llama-server の Embedding API を試行し，失敗時はローカルベクトルへフォールバックする．"""
         timeout = aiohttp.ClientTimeout(total=10)
         payload = {"input": text[:2000]}
         try:
@@ -69,20 +91,11 @@ class TroubleshootingRAGStore:
                                 return _normalize_vector([float(x) for x in raw_vec])
         except Exception:
             pass
-
         return _compute_local_hash_embedding(text)
 
-    def add_memory_sync(
-        self,
-        category: str,
-        error_pattern: str,
-        root_cause: str,
-        solution: str,
-    ) -> int:
-        """新規トラブルシューティング知見をベクトル化して DB に保存する．"""
+    def add_memory_sync(self, category: str, error_pattern: str, root_cause: str, solution: str) -> int:
         combined_text = f"{category} | {error_pattern} | {root_cause} | {solution}"
         vec = _compute_local_hash_embedding(combined_text)
-
         with get_db_session() as db:
             memo = TroubleshootingMemory(
                 category=category,
@@ -90,62 +103,63 @@ class TroubleshootingRAGStore:
                 root_cause=root_cause,
                 solution=solution,
                 embedding_json=json.dumps(vec),
+                success_count=0,
+                fail_count=0
             )
             db.add(memo)
             db.commit()
             db.refresh(memo)
+            self._is_loaded = False  # キャッシュ無効化
             return memo.id
 
-    async def search_relevant_memories(
-        self,
-        query_text: str,
-        top_k: int | None = None,
-        min_score: float = 0.18,
-    ) -> list[TroubleshootingMemory]:
-        """クエリ文字列（エラー出力や目標）に類似したトラブルシューティング知見を上位 K 件取得する．"""
+    async def search_relevant_memories(self, query_text: str, top_k: int | None = None, min_score: float = 0.15) -> list[TroubleshootingMemory]:
         if not query_text.strip():
             return []
-
         top_k = top_k or get_rag_top_k()
         query_vec = await self.get_embedding(query_text)
 
         with get_db_session() as db:
+            # 未計算レコードの動的バックフィル
             records = db.query(TroubleshootingMemory).all()
-            if not records:
-                return []
-
-            scored_records: list[tuple[float, TroubleshootingMemory]] = []
+            backfilled = False
             for rec in records:
-                combined = f"{rec.category} | {rec.error_pattern} | {rec.root_cause}"
-                rec_vec: list[float] = []
-
+                rec_vec = []
                 if rec.embedding_json:
                     try:
                         rec_vec = json.loads(rec.embedding_json)
                     except Exception:
-                        rec_vec = []
-
-                # 未ベクトル化または次元数不一致（API⇔ローカル切替時）ならオンザフライで再計算して更新
+                        pass
                 if len(rec_vec) != len(query_vec):
+                    combined = f"{rec.category} | {rec.error_pattern} | {rec.root_cause}"
                     if len(query_vec) == LOCAL_VEC_DIM:
                         rec_vec = _compute_local_hash_embedding(combined)
                     else:
                         rec_vec = await self.get_embedding(combined)
                     rec.embedding_json = json.dumps(rec_vec)
                     db.commit()
+                    backfilled = True
 
-                score = _cosine_similarity(query_vec, rec_vec)
-                if score >= min_score:
-                    db.expunge(rec)
-                    scored_records.append((score, rec))
+            if backfilled:
+                self._is_loaded = False
 
-        scored_records.sort(key=lambda item: item[0], reverse=True)
-        return [rec for _, rec in scored_records[:top_k]]
+            self._load_cache_if_needed(db)
+            
+            scored_ids = []
+            for cache in self._vector_cache:
+                if len(query_vec) != len(cache.vector):
+                    continue
+                sim = _cosine_similarity(query_vec, cache.vector)
+                final_score = sim * cache.success_score
+                if final_score >= min_score:
+                    scored_ids.append((final_score, cache.id))
+            
+            scored_ids.sort(key=lambda x: x[0], reverse=True)
+            top_ids = [cid for score, cid in scored_ids[:top_k]]
+            if not top_ids:
+                return []
+            return db.query(TroubleshootingMemory).filter(TroubleshootingMemory.id.in_(top_ids)).all()
 
-    def format_as_prompt_context(
-        self, memories: list[TroubleshootingMemory], header: str = "Relevant Past Troubleshooting Knowledge (RAG)"
-    ) -> str:
-        """検索された知見リストをプロンプト注入用のテキストに整形する．"""
+    def format_as_prompt_context(self, memories: list[TroubleshootingMemory], header: str = "Relevant Past Troubleshooting Knowledge (RAG)") -> str:
         if not memories:
             return ""
 
@@ -158,6 +172,22 @@ class TroubleshootingRAGStore:
             )
         lines.append("--------------------------------------------------")
         return "\n".join(lines)
+
+    def mark_memory_success(self, memory_ids: list[int], is_success: bool) -> None:
+        """エージェントの利用結果に基づいて評価（実績スコア）をアップデートする"""
+        if not memory_ids:
+            return
+        from datetime import UTC, datetime
+        with get_db_session() as db:
+            mems = db.query(TroubleshootingMemory).filter(TroubleshootingMemory.id.in_(memory_ids)).all()
+            for mem in mems:
+                if is_success:
+                    mem.success_count += 1
+                else:
+                    mem.fail_count += 1
+                mem.last_used_at = datetime.now(UTC)
+            db.commit()
+            self._is_loaded = False  # 次回の検索時にスコアを再計算させる
 
 
 # シングルトンインスタンス
