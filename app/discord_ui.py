@@ -239,9 +239,16 @@ async def enqueue_agent_with_dashboard(
     project_dir = get_projects_dir() / f"session_{session_id}"
     view = AgentDashboardView(session_id, project_dir)
 
+    # ---------------------------------------------------------
+    # ▼ 追加: Embedの横幅を強制拡張するための「つっかえ棒」文字列
+    # Discordの仕様上、半角スペースは連続すると詰められるため、
+    # ゼロ幅スペースや特殊な空白文字、あるいはMarkdownの罫線を活用します。
+    # ---------------------------------------------------------
+    WIDTH_SPACER = "ㅤ" * 60  # U+3164 (Hangul Filler) を使用して横幅を確保
+
     embed = discord.Embed(
         title=f"Project Runner - Session #{session_id}",
-        description=f"**目標**: {objective}",
+        description=f"**目標**: {objective}\n{WIDTH_SPACER}", # ▼ Descriptionの末尾にスペーサーを配置
         color=discord.Color.blue(),
         timestamp=datetime.now(UTC),
     )
@@ -291,21 +298,37 @@ async def enqueue_agent_with_dashboard(
         action_parts = []
         if tool_name:
             arg_str = json.dumps(tool_args, ensure_ascii=False) if tool_args else ""
-            if len(arg_str) > 100:
-                arg_str = arg_str[:100] + "..."
+            # ▼ 修正: JSONが極端に短い時でも高さをある程度保つため、
+            #         適度に改行を入れたり、長すぎるときはトランケートします
+            if len(arg_str) > 150:
+                arg_str = arg_str[:150] + "..."
+            
+            # ▼ コードブロック内にもスペーサーを含めることでブロック自体の幅を保つ
             action_parts.append(
                 f"**ツール**: `{tool_name}`\n```json\n{arg_str}\n```"
             )
+            
         if tool_output:
-            out_preview = (
-                tool_output[:300] + "..." if len(tool_output) > 300 else tool_output
-            )
+            # ▼ 修正: 出力のプレビュー行数や長さを固定化しやすくする
+            out_lines = tool_output.splitlines()
+            if len(out_lines) > 6:
+                out_preview = "\n".join(out_lines[:5]) + "\n...(省略)..."
+            elif len(tool_output) > 300:
+                out_preview = tool_output[:300] + "..."
+            else:
+                # 行数が少なすぎる場合は空行を足して高さを安定させる
+                padding_lines = "\n" * max(0, 3 - len(out_lines))
+                out_preview = tool_output + padding_lines
+
             action_parts.append(f"**出力**:\n```text\n{out_preview}\n```")
 
-        if action_parts:
-            embed.set_field_at(
-                1, name="最新アクション", value="\n".join(action_parts), inline=False
-            )
+        if not action_parts:
+            # アクションがない（推論中など）場合も、空のコードブロックを置いて高さをある程度保つ
+            action_parts.append(f"**思考中...**\n```text\n(Waiting for tool dispatch...)\n\n\n```")
+
+        embed.set_field_at(
+            1, name="最新アクション", value="\n".join(action_parts), inline=False
+        )
 
         try:
             await dashboard_msg.edit(embed=embed, view=view)
