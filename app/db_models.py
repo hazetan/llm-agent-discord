@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     DateTime,
     ForeignKey,
@@ -38,6 +39,10 @@ class GoalSession(Base):
 
     project_slug = Column(String(64), nullable=True)
     project_dir = Column(String(256), nullable=True)
+    
+    # ▼ 追加: フォーラム（スレッド）判定フラグ
+    is_forum = Column(Boolean, default=False)
+    
     artifact_zip = Column(String(256), nullable=True)
     docker_container = Column(String(64), nullable=True)
 

@@ -137,14 +137,36 @@ class SessionFileLogger:
         self._write_session_header()
 
     def _append_text(self, text: str) -> None:
-        """ログファイルへ即座に追記・フラッシュする．"""
+        """ログファイルへ即座に追記・フラッシュする．上限に達した場合はローテーションする．"""
         try:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # ▼ 追加: ログのローテーション（分割）処理
+            from .secrets import get_log_max_bytes
+            if self.log_path.exists() and self.log_path.stat().st_size >= get_log_max_bytes():
+                self._rotate_log()
+                
             with self.log_path.open("a", encoding="utf-8") as f:
                 f.write(text + "\n")
                 f.flush()
         except Exception as exc:
             print(f"[SessionFileLogger] Failed to write log to {self.log_path}: {exc}")
+
+    def _rotate_log(self) -> None:
+        """ログファイル名に part2, part3... を付けて新しいファイルに切り替える"""
+        self.part_number = getattr(self, "part_number", 1) + 1
+        base_path = get_session_log_path(self.session_id)
+        
+        # 拡張子がある場合とない場合でリネーム処理を分ける
+        if base_path.suffix:
+            new_name = f"{base_path.stem}_part{self.part_number}{base_path.suffix}"
+        else:
+            new_name = f"{base_path.name}_part{self.part_number}"
+            
+        self.log_path = base_path.with_name(new_name)
+        
+        # 新しいログファイルにもヘッダーを書き込む
+        self._append_text(f"\n{'='*80}\n# 🔄 LOG ROTATED: Continuing to Part {self.part_number}...\n{'='*80}\n")
 
     def _write_session_header(self) -> None:
         ctx_size = get_server_ctx_size()

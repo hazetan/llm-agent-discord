@@ -94,6 +94,7 @@ async def start_task(ctx, *, objective: str):
             channel_id=ctx.channel.id,
             message_id=ctx.message.id,
             project_slug=clean_slug,
+            is_forum=isinstance(ctx.channel, discord.Thread),
         )
         db.add(session)
         db.commit()

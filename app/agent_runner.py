@@ -202,6 +202,25 @@ async def run_agent_loop(
         # ▼ 1. DBから過去の履歴を全てロードし、再起動時の完全復元を行う
         db_msgs = db.query(SessionMessage).filter(SessionMessage.session_id == session_id).order_by(SessionMessage.id).all()
         raw_history = [json.loads(m.message_json) for m in db_msgs]
+        last_step = db_msgs[-1].step if db_msgs else 0
+
+        # ▼ 追加: 再起動時のツール宙ぶらりん対策（自己修復メカニズム）
+        if raw_history:
+            last_msg = raw_history[-1]
+            if last_msg.get("role") == "assistant" and "tool_calls" in last_msg:
+                # ツール結果を待っている間に落ちた場合、ダミーのエラーを返してLLMに再実行・再質問を促す
+                for call in last_msg["tool_calls"]:
+                    recovery_msg = {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "name": call["function"]["name"],
+                        "content": (
+                            "System Interruption: The bot was restarted while waiting for this tool's response. "
+                            "If this was 'ask_human', the user's response was lost. "
+                            "Please execute the tool again or ask the human again."
+                        )
+                    }
+                    _append_history(db, session_id, last_step, recovery_msg, raw_history)
 
         initial_memories = await rag_store.search_relevant_memories(session.objective)
         injected_memory_ids = {m.id for m in initial_memories}
@@ -209,6 +228,16 @@ async def run_agent_loop(
         pending_rag_labels = [f"[{m.category}] (ID:{m.id})" for m in initial_memories]
         
         system_content = AGENT_SYSTEM_PROMPT
+        
+        # ▼ 追加: フォーラムモード時の行動指示
+        if session.is_forum:
+            system_content += (
+                "\n\n[Forum Mode Directive]: You are operating in a persistent discussion thread. "
+                "Do NOT use 'finish_task' to end the session unless explicitly requested to close the project. "
+                "Instead, when you finish a sub-task or need feedback, use 'ask_human' to report your progress and ask what to do next. "
+                "This keeps the session active and interactive."
+            )
+
         if project_path == get_workspace_dir():
             try:
                 subdirs = [d for d in os.listdir(project_path) if os.path.isdir(project_path / d) and not d.startswith('.')]

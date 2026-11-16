@@ -205,3 +205,7 @@ def get_session_log_path(session_id: int) -> Path:
 def get_log_max_output_chars() -> int:
     """ログファイルに記録する1ツールあたりの最大出力文字数（LLM用の切り詰めとは独立）．"""
     return _get_int("LOG_MAX_OUTPUT_CHARS", 50000)
+
+def get_log_max_bytes() -> int:
+    """ログファイルを分割する上限サイズ（デフォルト: 5MB）"""
+    return _get_int("LOG_MAX_BYTES", 5 * 1024 * 1024)

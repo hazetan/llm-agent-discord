@@ -126,7 +126,7 @@ class AgentDashboardView(discord.ui.View):
 
     # ▼ 【1段目】実行中・待機中に使うボタン
     @discord.ui.button(
-        label="中断", style=discord.ButtonStyle.danger, custom_id="btn_stop", row=0
+        label="🛑 中断", style=discord.ButtonStyle.danger, custom_id="btn_stop", row=0
     )
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if agent_task_queue.cancel_session(self.session_id):
@@ -134,8 +134,29 @@ class AgentDashboardView(discord.ui.View):
         else:
             await interaction.response.send_message("既に完了しているか実行中ではありません．", ephemeral=True)
 
+    
+    # ▼ 新規追加: 「割り込み指示」ボタン
     @discord.ui.button(
-        label="成果物プレビュー", style=discord.ButtonStyle.secondary, custom_id="btn_files", row=0
+        label="⚡ 割り込み指示", style=discord.ButtonStyle.primary, custom_id="btn_inject", row=0
+    )
+    async def inject_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        with get_db_session() as db:
+            session = db.query(GoalSession).filter(GoalSession.id == self.session_id).first()
+            if not session:
+                await interaction.response.send_message("セッションが見つかりません．", ephemeral=True)
+                return
+            
+            if session.status not in ["running", "pending"]:
+                await interaction.response.send_message(
+                    "実行中ではないため割り込めません。「指示を追加して続行」を使用してください。", 
+                    ephemeral=True
+                )
+                return
+
+        await interaction.response.send_modal(InjectPromptModal(self.session_id))
+
+    @discord.ui.button(
+        label="📂 成果物プレビュー", style=discord.ButtonStyle.secondary, custom_id="btn_files", row=0
     )
     async def list_files_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         # （中略: 既存のコードをそのまま配置）
@@ -155,7 +176,7 @@ class AgentDashboardView(discord.ui.View):
         await interaction.response.send_message(msg[:MAX_DISCORD_MSG_LEN], ephemeral=True)
 
     @discord.ui.button(
-        label="ZIP出力", style=discord.ButtonStyle.primary, custom_id="btn_zip", row=0
+        label="📦 ZIP出力", style=discord.ButtonStyle.secondary, custom_id="btn_zip", row=0
     )
     async def zip_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         # （中略: 既存のコードをそのまま配置）
@@ -181,29 +202,10 @@ class AgentDashboardView(discord.ui.View):
         else:
             await interaction.followup.send(content="ZIPが25MBを超えているため送信できませんでした．", ephemeral=True)
 
-    # ▼ 新規追加: 「割り込み指示」ボタン
-    @discord.ui.button(
-        label="割り込み指示", style=discord.ButtonStyle.success, custom_id="btn_inject", row=0
-    )
-    async def inject_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        with get_db_session() as db:
-            session = db.query(GoalSession).filter(GoalSession.id == self.session_id).first()
-            if not session:
-                await interaction.response.send_message("セッションが見つかりません．", ephemeral=True)
-                return
-            
-            if session.status not in ["running", "pending"]:
-                await interaction.response.send_message(
-                    "実行中ではないため割り込めません。「指示を追加して続行」を使用してください。", 
-                    ephemeral=True
-                )
-                return
-
-        await interaction.response.send_modal(InjectPromptModal(self.session_id))
 
     # ▼ 【2段目】タスクが停止した後に「続きをやらせる」ボタン
     @discord.ui.button(
-        label="指示なし再ループ", style=discord.ButtonStyle.success, custom_id="btn_continue", row=1
+        label="▶️ そのまま作業を再開", style=discord.ButtonStyle.success, custom_id="btn_continue", row=1
     )
     async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         # （既存のコードをそのまま配置）
@@ -230,7 +232,7 @@ class AgentDashboardView(discord.ui.View):
         asyncio.create_task(enqueue_agent_with_dashboard(interaction.channel, self.session_id, objective))
     
     @discord.ui.button(
-        label="指示を追加して再ループ", style=discord.ButtonStyle.primary, custom_id="btn_continue_with_prompt", row=1
+        label="📝 指示を追加して再開", style=discord.ButtonStyle.primary, custom_id="btn_continue_with_prompt", row=1
     )
     async def continue_with_prompt_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         # （既存のコードをそのまま配置）
