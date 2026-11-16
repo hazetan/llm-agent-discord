@@ -279,6 +279,25 @@ async def run_agent_loop(
             else AGENT_SYSTEM_PROMPT
         )
 
+        # ---------------------------------------------------------
+        # ▼ 追加: 横断検索 (workspace_root) モード時のヒント注入
+        # ---------------------------------------------------------
+        from .secrets import get_projects_dir
+        if project_path == get_projects_dir():
+            try:
+                import os
+                # ルート直下にあるディレクトリ一覧を取得
+                subdirs = [d for d in os.listdir(project_path) if os.path.isdir(project_path / d) and not d.startswith('.')]
+                if subdirs:
+                    dir_list = ", ".join(subdirs)
+                    system_content += (
+                        f"\n\n[Workspace Root Hint]: You are currently in the root workspace directory. "
+                        f"The following project directories exist here: {dir_list}. "
+                        f"Use 'list_files' or 'read_file' targeting these subdirectories to find past projects."
+                    )
+            except Exception:
+                pass
+
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_content},
             {"role": "user", "content": f"Task Objective: {session.objective}"},

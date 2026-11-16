@@ -157,7 +157,7 @@ class DockerSandboxManager:
             except Exception:
                 pass
 
-            client.containers.run(
+            container = client.containers.run(
                 image=get_docker_image(),
                 command=["tail", "-f", "/dev/null"],
                 name=container_name,
@@ -168,10 +168,51 @@ class DockerSandboxManager:
                     str(project_dir.resolve()): {"bind": "/workspace", "mode": "rw"}
                 },
             )
+            
+            # ▼ 追加: 必須ユーティリティの自動インストール
+            try:
+                setup_cmd = "apt-get update && apt-get install -y git curl procps sqlite3"
+                container.exec_run(cmd=["sh", "-c", setup_cmd], user="root")
+            except Exception:
+                pass
+                
             return container_name
 
         # CLI フォールバック
         return self._ensure_container_cli(container_name, project_dir)
+
+    # CLI フォールバック側も同様に修正
+    def _ensure_container_cli(self, container_name: str, project_dir: Path) -> str:
+        check = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if check.returncode == 0 and "true" in check.stdout.lower():
+            return container_name
+
+        subprocess.run(["docker", "rm", "-f", container_name], check=False, capture_output=True)
+        cmd = [
+            "docker", "run", "-d",
+            "--name", container_name,
+            "-m", get_docker_mem_limit(),
+            "-v", f"{project_dir.resolve()}:/workspace",
+            "-w", "/workspace",
+            get_docker_image(),
+            "tail", "-f", "/dev/null",
+        ]
+        res = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"Docker container start failed: {res.stderr}")
+            
+        # ▼ 追加: CLI環境での必須ユーティリティ自動インストール
+        subprocess.run(
+            ["docker", "exec", "-u", "root", container_name, "sh", "-c", "apt-get update && apt-get install -y git curl procps sqlite3"],
+            check=False, capture_output=True
+        )
+            
+        return container_name
 
     def execute_command(
         self, session_id: int | None, workspace_dir: Path, command: str

@@ -167,13 +167,18 @@ def _tool_list_files(args: dict[str, Any], workspace_dir: Path, _: int | None) -
     return "\n".join(tree_lines) if tree_lines else "(directory is empty)"
 
 
-def _tool_run_command(
-    args: dict[str, Any], workspace_dir: Path, session_id: int | None
-) -> str:
-    cmd = str(args.get("command", "")).strip()
-    if not cmd:
-        return "Error: 'command' parameter is required."
-    return exec_in_docker(session_id, workspace_dir, cmd)
+def _tool_run_command(args: dict[str, Any], session_id: int, project_dir: Path) -> str:
+    command = args.get("command", "").strip()
+    if not command:
+        return "Error: Command is empty."
+
+    # ▼ 追加: サーバー起動コマンドのブロック回避インターセプタ
+    server_keywords = ["flask run", "python app.py", "python main.py", "uvicorn"]
+    if any(k in command for k in server_keywords) and "&" not in command and "nohup" not in command:
+        # 強制的にバックグラウンド実行に書き換え、1秒待ってから状態を確認する
+        command = f"nohup {command} > /tmp/server.log 2>&1 & sleep 1; echo 'Server started in background (PID: $!). Log: /tmp/server.log'"
+    
+    return exec_in_docker(session_id, project_dir, command)
 
 
 def _tool_git_diff(_: dict[str, Any], workspace_dir: Path, __: int | None) -> str:
