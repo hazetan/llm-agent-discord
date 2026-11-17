@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -12,7 +11,13 @@ from sqlalchemy.orm import Session
 from .context_builder import ContextBuilder
 from .db_models import Activity, GoalSession, Planner, SessionMessage
 from .db_system import SessionLocal
-from .llama_acc import chat_with_tools
+from .llama_acc import (
+    ask_llm,
+    chat_with_tools,
+    get_model_for_role,
+    parse_any_tool_calls,
+    select_optimal_model_for_step,
+)
 from .prompts_and_schemas import AGENT_SYSTEM_PROMPT, AVAILABLE_TOOLS
 from .rag_store import rag_store
 from .secrets import (
@@ -32,11 +37,17 @@ from .tools import execute_tool_async, init_git_repo, stop_docker_container
 
 INTERVENTION_QUEUES: dict[int, list[str]] = {}
 
-COMPLETION_KEYWORDS: tuple[str, ...] = ("完了", "finished", "complete")
 ERROR_INDICATORS: tuple[str, ...] = (
     "error", "exception", "traceback", "failed",
     "permission denied", "address already in use", "not found", "timed out",
 )
+# コーディング専用モデルで実行すべきツール群
+CODING_CRITICAL_TOOLS: set[str] = {
+    "write_file",
+    "replace_in_file",
+    "insert_into_file",
+    "record_troubleshooting",
+}
 
 
 def add_session_intervention(session_id: int, message: str) -> None:
@@ -51,31 +62,32 @@ def _pop_user_interventions(session_id: int) -> list[str]:
 
 def _append_history(db: Session, session_id: int, step: int, msg: dict[str, Any], raw_history: list[dict[str, Any]]):
     """メモリ上の履歴に追加しつつ、DBへも永続化する"""
-    raw_history.append(msg)
+    clean_msg = {k: v for k, v in msg.items() if not k.startswith("_")}
+    raw_history.append(clean_msg)
     sm = SessionMessage(
         session_id=session_id,
         step=step,
-        role=msg.get("role", "unknown"),
-        message_json=json.dumps(msg, ensure_ascii=False)
+        role=clean_msg.get("role", "unknown"),
+        message_json=json.dumps(clean_msg, ensure_ascii=False),
     )
     db.add(sm)
     db.commit()
 
 
 def extract_tool_call_from_text(content: str) -> dict[str, Any] | None:
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if not match: return None
-    try:
-        data = json.loads(match.group(1))
-        if isinstance(data, dict) and "name" in data and "arguments" in data:
-            return data
-    except Exception:
-        pass
+    calls = parse_any_tool_calls(content)
+    if calls:
+        fn = calls[0].get("function", {})
+        return {
+            "name": fn.get("name"),
+            "arguments": parse_tool_arguments(fn.get("arguments")),
+        }
     return None
 
 
 def parse_tool_arguments(raw_args: Any) -> dict[str, Any]:
-    if isinstance(raw_args, dict): return raw_args
+    if isinstance(raw_args, dict):
+        return raw_args
     if isinstance(raw_args, str):
         try:
             parsed = json.loads(raw_args)
@@ -87,7 +99,8 @@ def parse_tool_arguments(raw_args: Any) -> dict[str, Any]:
 
 def build_handover_context(db: Session, session_id: int) -> str:
     latest_plan = db.query(Planner).filter(Planner.session_id == session_id).order_by(Planner.id.desc()).first()
-    if not latest_plan: return "No persistent planner history available."
+    if not latest_plan:
+        return "No persistent planner history available."
 
     return (
         "--- [Project State Handover] ---\n"
@@ -117,7 +130,7 @@ async def _inject_rag_hint_on_error(
     injected_memory_ids: set[int],
     db: Session,
     session_id: int,
-    step: int
+    step: int,
 ) -> tuple[list[str], list[int]]:
     lower_out = tool_output.lower()
     if not any(indicator in lower_out for indicator in ERROR_INDICATORS):
@@ -140,15 +153,59 @@ async def _inject_rag_hint_on_error(
     return hit_labels, used_ids
 
 
-async def _request_llm_with_metrics(messages: list[dict[str, Any]], max_retries: int = 2) -> tuple[dict[str, Any], float, int]:
+async def _request_llm_with_metrics(
+    messages: list[dict[str, Any]],
+    step: int,
+    objective: str,
+    raw_history: list[dict[str, Any]],
+    dashboard_callback: Callable | None = None,
+    max_steps: int = 40,
+    max_retries: int = 2,
+) -> tuple[dict[str, Any], float, int, str, str]:
     start_t = time.perf_counter()
     for attempt in range(max_retries):
+        role, model_name = await select_optimal_model_for_step(
+            step=step,
+            objective=objective,
+            raw_history=raw_history,
+            retry_attempt=attempt,
+        )
+        if dashboard_callback:
+            await dashboard_callback(
+                step=step,
+                max_steps=max_steps,
+                status=f"Thinking [{role}: {model_name}]...",
+            )
+
         try:
-            response_msg = await chat_with_tools(messages, tools=AVAILABLE_TOOLS)
+            response_msg = await chat_with_tools(
+                messages, tools=AVAILABLE_TOOLS, role=role, model=model_name
+            )
+
+            coding_model = get_model_for_role("coding")
+            if model_name != coding_model:
+                t_calls = response_msg.get("tool_calls") or []
+                called_names = {tc.get("function", {}).get("name", "") for tc in t_calls}
+                needs_coder_escalation = bool(called_names & CODING_CRITICAL_TOOLS) or not t_calls
+
+                if needs_coder_escalation:
+                    role = "coding"
+                    model_name = coding_model
+                    if dashboard_callback:
+                        await dashboard_callback(
+                            step=step,
+                            max_steps=max_steps,
+                            status=f"Escalating to Coder [{model_name}]...",
+                        )
+                    response_msg = await chat_with_tools(
+                        messages, tools=AVAILABLE_TOOLS, role="coding", model=coding_model
+                    )
+
             latency = time.perf_counter() - start_t
-            return response_msg, latency, attempt
+            return response_msg, latency, attempt, role, model_name
         except Exception as exc:
-            if attempt + 1 >= max_retries: raise
+            if attempt + 1 >= max_retries:
+                raise
             await asyncio.sleep(2)
             messages.append({"role": "user", "content": f"Tool execution failed with server error ({exc}). Retry."})
     raise RuntimeError("Unreachable retry state")
@@ -162,9 +219,11 @@ def _truncate_output(output: str) -> str:
 
 
 def _classify_tool_status(tool_output: str, is_repeat_blocked: bool) -> str:
-    if is_repeat_blocked: return "BLOCKED_REPEAT"
+    if is_repeat_blocked:
+        return "BLOCKED_REPEAT"
     lower = tool_output.lower()
-    if lower.startswith("error:") or any(k in lower for k in ERROR_INDICATORS): return "ERROR"
+    if lower.startswith("error:") or any(k in lower for k in ERROR_INDICATORS):
+        return "ERROR"
     return "SUCCESS"
 
 
@@ -173,6 +232,63 @@ def _record_activity(db: Session, session_id: int, tool_name: str, args: dict[st
     activity = Activity(session_id=session_id, work=f"[{tool_name}] {args_summary}", result=result[:500])
     db.add(activity)
     db.commit()
+
+
+async def _run_auto_qa_review(
+    session_id: int, 
+    objective: str, 
+    raw_history: list[dict[str, Any]], 
+    db: Session
+) -> tuple[bool, str]:
+    """
+    finish_task が呼ばれた際、タスクが真に完了しているかをシステム的に検証するガードレール。
+    """
+    # 1. Planner の残務確認ガード
+    latest_plan = db.query(Planner).filter(Planner.session_id == session_id).order_by(Planner.id.desc()).first()
+    if latest_plan and latest_plan.future_issue:
+        fi = latest_plan.future_issue.strip().lower()
+        if fi not in ["none", "なし", "n/a", "", "null", "nothing"]:
+            return False, f"System Guard: Planner still has a future_issue: '{latest_plan.future_issue}'. You must resolve it before finishing."
+
+    # 2. QA Reviewer (codingモデル) による客観審査ガード
+    history_snippets = []
+    for m in raw_history[-10:]:
+        role = m.get("role", "")
+        if role == "tool":
+            history_snippets.append(f"Tool {m.get('name')} returned: {str(m.get('content'))[:300]}")
+        elif role == "assistant" and "tool_calls" in m:
+            calls = [tc.get("function", {}).get("name") for tc in m.get("tool_calls", [])]
+            history_snippets.append(f"Agent called: {calls}")
+    history_text = "\n".join(history_snippets)
+
+    qa_prompt = (
+        "You are a strict System QA Reviewer.\n"
+        f"Original Objective: {objective}\n\n"
+        "Recent Agent Actions:\n"
+        f"{history_text}\n\n"
+        "The agent just attempted to call `finish_task`. Evaluate if the original objective is FULLY implemented, tested, and complete.\n"
+        "If there are missing features, unhandled errors, or it seems incomplete, you must REJECT it.\n"
+        "Output ONLY a JSON object exactly like this:\n"
+        "{\n"
+        '  "approved": true or false,\n'
+        '  "reason": "If false, point out what is missing or needs testing. If true, say Approved."\n'
+        "}"
+    )
+
+    qa_result = await ask_llm(qa_prompt, role="coding")
+    try:
+        import re
+        clean_json = re.sub(r"```(?:json)?\s*(.*?)\s*```", r"\1", qa_result, flags=re.DOTALL).strip()
+        data = json.loads(clean_json)
+        approved = data.get("approved", False)
+        reason = data.get("reason", "Missing requirements.")
+        if not approved:
+            return False, f"QA Review Rejected: {reason}"
+        return True, "QA Approved."
+    except Exception:
+        if "true" in qa_result.lower():
+            return True, "QA Approved (fallback parsing)."
+        return False, "QA Review Rejected: Could not objectively verify completion. Check if you missed any requirements or tests."
 
 
 async def run_agent_loop(
@@ -191,24 +307,27 @@ async def run_agent_loop(
 
     try:
         session = db.query(GoalSession).filter(GoalSession.id == session_id).first()
-        if not session: return "Session not found."
+        if not session:
+            return "Session not found."
 
         project_path = _prepare_session_workspace(session)
         session.status = "running"
         db.commit()
 
-        session_logger = SessionFileLogger(session_id=session_id, title=session.title, objective=session.objective, workspace_dir=project_path)
+        session_logger = SessionFileLogger(
+            session_id=session_id,
+            title=session.title,
+            objective=session.objective,
+            workspace_dir=project_path,
+        )
 
-        # ▼ 1. DBから過去の履歴を全てロードし、再起動時の完全復元を行う
         db_msgs = db.query(SessionMessage).filter(SessionMessage.session_id == session_id).order_by(SessionMessage.id).all()
         raw_history = [json.loads(m.message_json) for m in db_msgs]
         last_step = db_msgs[-1].step if db_msgs else 0
 
-        # ▼ 追加: 再起動時のツール宙ぶらりん対策（自己修復メカニズム）
         if raw_history:
             last_msg = raw_history[-1]
             if last_msg.get("role") == "assistant" and "tool_calls" in last_msg:
-                # ツール結果を待っている間に落ちた場合、ダミーのエラーを返してLLMに再実行・再質問を促す
                 for call in last_msg["tool_calls"]:
                     recovery_msg = {
                         "role": "tool",
@@ -218,7 +337,7 @@ async def run_agent_loop(
                             "System Interruption: The bot was restarted while waiting for this tool's response. "
                             "If this was 'ask_human', the user's response was lost. "
                             "Please execute the tool again or ask the human again."
-                        )
+                        ),
                     }
                     _append_history(db, session_id, last_step, recovery_msg, raw_history)
 
@@ -226,10 +345,9 @@ async def run_agent_loop(
         injected_memory_ids = {m.id for m in initial_memories}
         used_rag_ids.update(injected_memory_ids)
         pending_rag_labels = [f"[{m.category}] (ID:{m.id})" for m in initial_memories]
-        
+
         system_content = AGENT_SYSTEM_PROMPT
-        
-        # ▼ 追加: フォーラムモード時の行動指示
+
         if session.is_forum:
             system_content += (
                 "\n\n[Forum Mode Directive]: You are operating in a persistent discussion thread. "
@@ -240,7 +358,7 @@ async def run_agent_loop(
 
         if project_path == get_workspace_dir():
             try:
-                subdirs = [d for d in os.listdir(project_path) if os.path.isdir(project_path / d) and not d.startswith('.')]
+                subdirs = [d for d in os.listdir(project_path) if os.path.isdir(project_path / d) and not d.startswith(".")]
                 if subdirs:
                     system_content += f"\n\n[Workspace Root Hint]: Directories here: {', '.join(subdirs)}."
             except Exception:
@@ -250,11 +368,9 @@ async def run_agent_loop(
         repeat_count = 0
 
         for step in range(1, max_steps + 1):
-            # ▼ 2. 割り込み指示を履歴に保存
             for inv in _pop_user_interventions(session_id):
                 _append_history(db, session_id, step, {"role": "user", "content": f"[User Mid-Course Correction]: {inv}"}, raw_history)
 
-            # ▼ 3. ContextBuilder でトークン上限に合わせて賢く組み立てる
             builder = ContextBuilder(get_prompt_token_limit())
             builder.set_system(system_content)
             builder.set_objective(session.objective)
@@ -263,45 +379,70 @@ async def run_agent_loop(
 
             prompt_messages, compressed, handover_text = builder.build_messages(raw_history)
 
-            if dashboard_callback:
-                await dashboard_callback(step=step, max_steps=max_steps, status="Thinking (LLM推論中)...")
-
-            response_msg, latency_sec, retries = await _request_llm_with_metrics(prompt_messages)
+            response_msg, latency_sec, retries, selected_role, selected_model = await _request_llm_with_metrics(
+                messages=prompt_messages,
+                step=step,
+                objective=session.objective,
+                raw_history=raw_history,
+                dashboard_callback=dashboard_callback,
+                max_steps=max_steps,
+            )
             actual_usage = response_msg.pop("_usage", None)
+            response_msg.pop("_model_used", None)
 
             log_token_usage(step, max_steps, session_id, prompt_messages, AVAILABLE_TOOLS, actual_usage)
 
             content = (response_msg.get("content") or "").strip()
             tool_calls = response_msg.get("tool_calls")
-            dispatch_mode = "native_tool_calls" if tool_calls else "text_only"
+            dispatch_mode = f"native_tool_calls ({selected_role}:{selected_model})" if tool_calls else f"text_only ({selected_role}:{selected_model})"
 
             if not tool_calls:
                 fallback_tool = extract_tool_call_from_text(content)
-                if fallback_tool:
-                    dispatch_mode = "fallback_json"
-                    tool_calls = [{"id": f"fallback_call_{step}", "function": {"name": fallback_tool["name"], "arguments": json.dumps(fallback_tool["arguments"])}}]
+                if fallback_tool and fallback_tool.get("name"):
+                    dispatch_mode = f"fallback_parsed ({selected_role}:{selected_model})"
+                    tool_calls = [{
+                        "id": f"fallback_call_{step}",
+                        "type": "function",
+                        "function": {
+                            "name": fallback_tool["name"],
+                            "arguments": json.dumps(fallback_tool["arguments"], ensure_ascii=False),
+                        },
+                    }]
+                    response_msg["tool_calls"] = tool_calls
 
-            inference_telemetry = session_logger.build_inference_telemetry(prompt_messages, AVAILABLE_TOOLS, actual_usage, latency_sec, retries, dispatch_mode, content)
-            step_record = StepLogRecord(step=step, max_steps=max_steps, context_compressed=compressed, handover_snapshot=handover_text, rag_injected_titles=list(pending_rag_labels), inference=inference_telemetry)
+            inference_telemetry = session_logger.build_inference_telemetry(
+                prompt_messages, AVAILABLE_TOOLS, actual_usage, latency_sec, retries, dispatch_mode, content
+            )
+            step_record = StepLogRecord(
+                step=step,
+                max_steps=max_steps,
+                context_compressed=compressed,
+                handover_snapshot=handover_text,
+                rag_injected_titles=[f"Model:{selected_model}({selected_role})", *pending_rag_labels],
+                inference=inference_telemetry,
+            )
             pending_rag_labels.clear()
 
-            # ▼ 4. アシスタントの返答を履歴とDBに保存
             _append_history(db, session_id, step, response_msg, raw_history)
 
             if dashboard_callback:
-                await dashboard_callback(step=step, max_steps=max_steps, thought=content, status="Tool Dispatching...")
+                await dashboard_callback(
+                    step=step,
+                    max_steps=max_steps,
+                    thought=content,
+                    status=f"Tool Dispatching [{selected_role}: {selected_model}]...",
+                )
 
+            # ▼ ガード: テキスト内に「完了」と書かれていても絶対に終了させない (直接関数呼び出しを要求)
             if not tool_calls:
                 session_logger.log_step(step_record)
-                if content and any(k in content.lower() for k in COMPLETION_KEYWORDS):
-                    final_result = content
-                    session.status = "completed"
-                    db.commit()
-                    session_logger.log_session_summary("completed", final_result)
-                    rag_store.mark_memory_success(list(used_rag_ids), True)
-                    return final_result
-
-                _append_history(db, session_id, step, {"role": "user", "content": "Directly invoke tool using function calling schema."}, raw_history)
+                _append_history(
+                    db,
+                    session_id,
+                    step,
+                    {"role": "user", "content": "Directly invoke a tool using the function calling schema. Do NOT end the task with text only."},
+                    raw_history,
+                )
                 continue
 
             finish_called = False
@@ -316,34 +457,94 @@ async def run_agent_loop(
                     repeat_count = 0
 
                 if dashboard_callback:
-                    await dashboard_callback(step=step, max_steps=max_steps, thought=content, tool_name=tool_name, tool_args=args, status=f"Executing {tool_name}...")
+                    await dashboard_callback(
+                        step=step,
+                        max_steps=max_steps,
+                        thought=content,
+                        tool_name=f"{tool_name} ({selected_model})",
+                        tool_args=args,
+                        status=f"Executing {tool_name} [{selected_role}]...",
+                    )
 
                 tool_start_t = time.perf_counter()
                 is_repeat_blocked = repeat_count >= 1
 
                 if is_repeat_blocked:
-                    tool_output = f"Error: Repetitive action detected for '{tool_name}'."
+                    tool_output = f"Error: Repetitive action detected for '{tool_name}'. Change your approach or arguments."
                 else:
-                    tool_output = await execute_tool_async(tool_name, args, session_id=session_id, project_dir=project_path, human_ask_callback=human_ask_callback)
+                    tool_output = await execute_tool_async(
+                        tool_name,
+                        args,
+                        session_id=session_id,
+                        project_dir=project_path,
+                        human_ask_callback=human_ask_callback,
+                    )
 
                 tool_duration = time.perf_counter() - tool_start_t
                 truncated_output = _truncate_output(tool_output)
                 tool_status = _classify_tool_status(tool_output, is_repeat_blocked)
 
-                step_record.tool_executions.append(ToolExecutionRecord(tool_name=tool_name, args=args, duration_sec=tool_duration, status=tool_status, raw_output=tool_output, sent_output_len=len(truncated_output)))
+                # ▼ ガード: finish_task が呼ばれた際のシステム検証 (Planner & QA)
+                if tool_name == "finish_task":
+                    if dashboard_callback:
+                        await dashboard_callback(
+                            step=step,
+                            max_steps=max_steps,
+                            thought=content,
+                            tool_name="System QA Guard",
+                            tool_args={},
+                            status="Running QA Review...",
+                        )
+                    
+                    approved, qa_msg = await _run_auto_qa_review(session_id, session.objective, raw_history, db)
+                    
+                    if not approved:
+                        # 検証失敗：エラーとして差し戻す（終了フラグは立てない）
+                        tool_output = f"Error (System Guard): finish_task rejected.\n{qa_msg}\nPlease continue working to fulfill this."
+                        truncated_output = _truncate_output(tool_output)
+                        tool_status = "ERROR"
+                        finish_called = False
+                    else:
+                        tool_output = tool_output + f"\n\n[System QA]: {qa_msg}"
+                        truncated_output = _truncate_output(tool_output)
+                        final_result = tool_output
+                        finish_called = True
+
+                step_record.tool_executions.append(
+                    ToolExecutionRecord(
+                        tool_name=tool_name,
+                        args=args,
+                        duration_sec=tool_duration,
+                        status=tool_status,
+                        raw_output=tool_output,
+                        sent_output_len=len(truncated_output),
+                    )
+                )
 
                 if dashboard_callback:
-                    await dashboard_callback(step=step, max_steps=max_steps, thought=content, tool_name=tool_name, tool_args=args, tool_output=truncated_output, status="Step Completed")
+                    await dashboard_callback(
+                        step=step,
+                        max_steps=max_steps,
+                        thought=content,
+                        tool_name=f"{tool_name} ({selected_model})",
+                        tool_args=args,
+                        tool_output=truncated_output,
+                        status=f"Step Completed [{selected_role}]",
+                    )
 
-                _record_activity(db, session_id, tool_name, args, truncated_output)
-                if tool_name == "finish_task":
-                    final_result = tool_output
-                    finish_called = True
+                _record_activity(db, session_id, f"{tool_name}@{selected_model}", args, truncated_output)
+                
+                _append_history(
+                    db,
+                    session_id,
+                    step,
+                    {"role": "tool", "tool_call_id": call["id"], "name": tool_name, "content": truncated_output},
+                    raw_history,
+                )
 
-                # ▼ 5. ツールの結果を履歴とDBに保存
-                _append_history(db, session_id, step, {"role": "tool", "tool_call_id": call["id"], "name": tool_name, "content": truncated_output}, raw_history)
-
-                hits, mem_ids = await _inject_rag_hint_on_error(truncated_output, raw_history, injected_memory_ids, db, session_id, step)
+                hits, mem_ids = await _inject_rag_hint_on_error(
+                    truncated_output, raw_history, injected_memory_ids, db, session_id, step
+                )
                 pending_rag_labels.extend(hits)
                 used_rag_ids.update(mem_ids)
 
@@ -353,14 +554,12 @@ async def run_agent_loop(
                 session.status = "completed"
                 db.commit()
                 session_logger.log_session_summary("completed", final_result)
-                # ▼ 成功時: 使用したノウハウを評価＋１
                 rag_store.mark_memory_success(list(used_rag_ids), True)
                 return final_result
 
         session.status = "failed"
         db.commit()
         session_logger.log_session_summary("failed", final_result)
-        # ▼ 失敗時: 役に立たなかったノウハウとして評価－１
         rag_store.mark_memory_success(list(used_rag_ids), False)
         return final_result
 
@@ -370,7 +569,8 @@ async def run_agent_loop(
         if session:
             session.status = "cancelled"
             db.commit()
-        if session_logger: session_logger.log_session_summary("cancelled", "Session cancelled by user.")
+        if session_logger:
+            session_logger.log_session_summary("cancelled", "Session cancelled by user.")
         raise
     except Exception as exc:
         db.rollback()
@@ -379,7 +579,8 @@ async def run_agent_loop(
         if session:
             session.status = "failed"
             db.commit()
-        if session_logger: session_logger.log_session_summary("failed", err_msg)
+        if session_logger:
+            session_logger.log_session_summary("failed", err_msg)
         return err_msg
     finally:
         stop_docker_container(session_id)

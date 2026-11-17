@@ -48,33 +48,105 @@ def _get_bool(key: str, default: bool = True) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-# --- 認証・エンドポイント設定 ---
+# --- 認証・Ollama エンドポイント設定 ---
 def load_token() -> str:
     return _get_str("DISCORD_TOKEN", "")
 
 
+def get_ollama_base_url() -> str:
+    """Ollama サーバーのベース URL (例: http://192.168.1.10:11434) を返す．"""
+    base = _get_str("OLLAMA_BASE_URL", "") or _get_str("OLLAMA_HOST", "")
+    if not base:
+        legacy = _get_str("LLAMA_SERVER_URL", "")
+        if legacy:
+            for suffix in ("/v1/chat/completions", "/api/chat", "/v1", "/api"):
+                if legacy.endswith(suffix):
+                    legacy = legacy[: -len(suffix)]
+                    break
+            base = legacy
+    if not base:
+        base = "http://localhost:11434"
+    if not base.startswith(("http://", "https://")):
+        base = f"http://{base}"
+    return base.rstrip("/")
+
+
 def get_llama_server_url() -> str:
-    return _get_str(
-        "LLAMA_SERVER_URL", ""
-    )
+    """OpenAI 互換の Chat Completions エンドポイントを返す．"""
+    return f"{get_ollama_base_url()}/v1/chat/completions"
+
+
+def get_ollama_api_chat_url() -> str:
+    """Ollama ネイティブの /api/chat エンドポイントを返す．"""
+    return f"{get_ollama_base_url()}/api/chat"
+
+
+def get_ollama_tags_url() -> str:
+    """Ollama の利用可能モデル一覧取得エンドポイント (/api/tags) を返す．"""
+    return f"{get_ollama_base_url()}/api/tags"
+
+
+def get_ollama_systemone_url() -> str:
+    """Liquid AI d1 モデル用の意思決定エンドポイント (/v1/systemone) を返す．"""
+    return f"{get_ollama_base_url()}/v1/systemone"
 
 
 def get_llama_embedding_url() -> str:
     custom_url = _get_str("LLAMA_EMBEDDING_URL", "")
     if custom_url:
         return custom_url
-    return get_llama_server_url().replace("/chat/completions", "/embeddings")
+    return f"{get_ollama_base_url()}/v1/embeddings"
+
+
+# --- ロール別モデル設定 (Ollama) ---
+def get_model_decision() -> str:
+    """判断・意図分類・ルーティング用モデル"""
+    return _get_str("MODEL_DECISION", "d1-2B:Q4_K_M")
+
+
+def get_model_coding() -> str:
+    """コーディング・設計・複雑な推論・デバッグ用モデル"""
+    return _get_str("MODEL_CODING", "Qwen2.5-Coder-14B-Instruct:Q4_K_M")
+
+
+def get_model_system_cmd() -> str:
+    """システムコマンド実行・ファイル探索・ツール呼び出し用モデル"""
+    return _get_str("MODEL_SYSTEM_CMD", "LFM3-1.7B:Q8_0")
+
+
+def get_model_light_work() -> str:
+    """ちょっとした作業・要約・雑談・軽量テキスト生成用モデル"""
+    return _get_str("MODEL_LIGHT_WORK", "LFM3-1.7B:Q4_K_M")
+
+
+def get_model_vision() -> str:
+    """画像・視覚理解用モデル"""
+    return _get_str("MODEL_VISION", "LFM3-VL-2B:Q4_K_M")
+
+
+def get_model_audio() -> str:
+    """音声処理用モデル"""
+    return _get_str("MODEL_AUDIO", "LFM3-Audio-2B:Q4_K_M")
+
+
+def get_model_omni() -> str:
+    """マルチモーダル・総合対話用モデル"""
+    return _get_str("MODEL_OMNI", "LFM3-Omni-2B:Q4_K_M")
+
+
+def get_ollama_keep_alive() -> str:
+    """Ollama がモデルを VRAM に保持する時間"""
+    return _get_str("OLLAMA_KEEP_ALIVE", "10m")
 
 
 # --- トークン・コンテキスト動的スケーリング設定 ---
 def get_server_ctx_size() -> int:
-    return _get_int("SERVER_CTX_SIZE", 65536)
+    return _get_int("SERVER_CTX_SIZE", 32768)
 
 
 def get_max_token() -> int:
     ctx_size = get_server_ctx_size()
-    # 万が一 MAX_TOKEN が SERVER_CTX_SIZE 以上に設定されても，全体の半分以下に自動クランプする
-    raw_max = _get_int("MAX_TOKEN", 8192)
+    raw_max = _get_int("MAX_TOKEN", 4096)
     return min(raw_max, max(1024, ctx_size // 2))
 
 
@@ -83,31 +155,26 @@ def get_chars_per_token() -> float:
 
 
 def get_ctx_safety_margin() -> int:
-    """コンテキスト圧縮を発動させる安全マージン（未指定時は CTX の約 5%，最小 1024）．"""
     default_margin = max(1024, min(4096, get_server_ctx_size() // 20))
     return _get_int("CTX_SAFETY_MARGIN", default_margin)
 
 
 def get_prompt_token_limit() -> int:
-    """プロンプト履歴が使用できる最大トークン数の上限を動的に算出する．"""
     limit = get_server_ctx_size() - get_max_token() - get_ctx_safety_margin()
     return max(2048, limit)
 
 
 def get_max_output_chars() -> int:
-    """1回のツール出力で保持する最大文字数（未指定時は CTX サイズに応じて自動スケール）．"""
     default_chars = max(4000, min(20000, get_server_ctx_size() // 5))
     return _get_int("MAX_OUTPUT_CHARS", default_chars)
 
 
 def get_max_history_messages() -> int:
-    """圧縮前に保持する最大メッセージ数（未指定時は CTX 16k あたり 16 件で自動スケール）．"""
     default_msgs = max(16, (get_server_ctx_size() // 16384) * 16)
     return _get_int("MAX_HISTORY_MESSAGES", default_msgs)
 
 
 def get_keep_recent_messages() -> int:
-    """コンテキスト圧縮時に末尾に残す直近メッセージ件数．"""
     default_keep = max(8, get_max_history_messages() // 3)
     return _get_int("KEEP_RECENT_MESSAGES", default_keep)
 
@@ -146,20 +213,22 @@ def get_rag_top_k() -> int:
     return _get_int("RAG_TOP_K", 3)
 
 
-def get_Sampling_config(use_xtc: bool = True) -> dict[str, Any]:
-    """LLM 推論用のサンプリングパラメータ一式を .env から動的構築して返す．"""
+def get_Sampling_config(use_xtc: bool = False, model_name: str = "") -> dict[str, Any]:
+    """Ollama および対象モデルに最適化したサンプリングパラメータを構築して返す．"""
+    lower_model = model_name.lower()
+    if "d1" in lower_model:
+        temp = 0.0
+    elif "lfm3" in lower_model:
+        # Liquid AI LFM3 推奨の低温度設定
+        temp = _get_float("LLM_TEMP_LFM3", 0.1)
+    elif "qwen" in lower_model or "coder" in lower_model:
+        temp = _get_float("LLM_TEMP_CODING", 0.2)
+    else:
+        temp = _get_float("LLM_TEMP", 0.2)
+
     return {
-        "temperature": _get_float("LLM_TEMP", 0.3),
-        "min_p": _get_float("LLM_MIN_P", 0.05),
-        "repeat_penalty": _get_float("LLM_REPEAT_PENALTY", 1.05),
-        "repeat_last_n": _get_int("LLM_REPEAT_LAST_N", 512),
-        "frequency_penalty": _get_float("LLM_FREQ_PENALTY", 0.05),
-        "dry_multiplier": _get_float("LLM_DRY_MULTIPLIER", 0.8),
-        "dry_base": _get_float("LLM_DRY_BASE", 1.75),
-        "dry_allowed_length": _get_int("LLM_DRY_ALLOWED_LEN", 2),
-        "xtc_probability": _get_float("LLM_XTC_PROB", 0.5) if use_xtc else 0.0,
-        "xtc_threshold": _get_float("LLM_XTC_THRESHOLD", 0.1),
-        "cache_prompt": _get_bool("LLM_CACHE_PROMPT", True),
+        "temperature": temp,
+        "top_p": _get_float("LLM_TOP_P", 0.9),
     }
 
 
@@ -182,7 +251,6 @@ def get_projects_dir() -> Path:
 
 
 def get_log_dir() -> Path:
-    """セッションログ保存用ディレクトリ (.log) のパスを返す．"""
     custom_log_dir = _get_str("LOG_DIR")
     if custom_log_dir:
         log_dir = Path(custom_log_dir).expanduser().resolve()
@@ -194,18 +262,13 @@ def get_log_dir() -> Path:
 
 
 def get_session_log_path(session_id: int) -> Path:
-    """
-    指定されたセッションIDのログファイルパス（例: .log/session0）を返す．
-    .env で LOG_FILE_SUFFIX=.log 等を指定した場合は拡張子を付与可能（デフォルトは拡張子なし）．
-    """
     suffix = _get_str("LOG_FILE_SUFFIX", "")
     return get_log_dir() / f"session{session_id}{suffix}"
 
 
 def get_log_max_output_chars() -> int:
-    """ログファイルに記録する1ツールあたりの最大出力文字数（LLM用の切り詰めとは独立）．"""
     return _get_int("LOG_MAX_OUTPUT_CHARS", 50000)
 
+
 def get_log_max_bytes() -> int:
-    """ログファイルを分割する上限サイズ（デフォルト: 5MB）"""
     return _get_int("LOG_MAX_BYTES", 5 * 1024 * 1024)

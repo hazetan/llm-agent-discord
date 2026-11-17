@@ -8,7 +8,7 @@ import aiohttp
 
 from .db_models import TroubleshootingMemory
 from .db_system import get_db_session
-from .secrets import get_llama_embedding_url, get_rag_top_k
+from .secrets import get_llama_embedding_url, get_model_light_work, get_rag_top_k
 
 LOCAL_VEC_DIM = 256
 
@@ -79,7 +79,10 @@ class TroubleshootingRAGStore:
 
     async def get_embedding(self, text: str) -> list[float]:
         timeout = aiohttp.ClientTimeout(total=10)
-        payload = {"input": text[:2000]}
+        payload = {
+            "model": get_model_light_work(),
+            "input": text[:2000],
+        }
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(get_llama_embedding_url(), json=payload) as resp:
@@ -104,22 +107,23 @@ class TroubleshootingRAGStore:
                 solution=solution,
                 embedding_json=json.dumps(vec),
                 success_count=0,
-                fail_count=0
+                fail_count=0,
             )
             db.add(memo)
             db.commit()
             db.refresh(memo)
-            self._is_loaded = False  # キャッシュ無効化
+            self._is_loaded = False
             return memo.id
 
-    async def search_relevant_memories(self, query_text: str, top_k: int | None = None, min_score: float = 0.15) -> list[TroubleshootingMemory]:
+    async def search_relevant_memories(
+        self, query_text: str, top_k: int | None = None, min_score: float = 0.15
+    ) -> list[TroubleshootingMemory]:
         if not query_text.strip():
             return []
         top_k = top_k or get_rag_top_k()
         query_vec = await self.get_embedding(query_text)
 
         with get_db_session() as db:
-            # 未計算レコードの動的バックフィル
             records = db.query(TroubleshootingMemory).all()
             backfilled = False
             for rec in records:
@@ -143,7 +147,7 @@ class TroubleshootingRAGStore:
                 self._is_loaded = False
 
             self._load_cache_if_needed(db)
-            
+
             scored_ids = []
             for cache in self._vector_cache:
                 if len(query_vec) != len(cache.vector):
@@ -152,14 +156,16 @@ class TroubleshootingRAGStore:
                 final_score = sim * cache.success_score
                 if final_score >= min_score:
                     scored_ids.append((final_score, cache.id))
-            
+
             scored_ids.sort(key=lambda x: x[0], reverse=True)
             top_ids = [cid for score, cid in scored_ids[:top_k]]
             if not top_ids:
                 return []
             return db.query(TroubleshootingMemory).filter(TroubleshootingMemory.id.in_(top_ids)).all()
 
-    def format_as_prompt_context(self, memories: list[TroubleshootingMemory], header: str = "Relevant Past Troubleshooting Knowledge (RAG)") -> str:
+    def format_as_prompt_context(
+        self, memories: list[TroubleshootingMemory], header: str = "Relevant Past Troubleshooting Knowledge (RAG)"
+    ) -> str:
         if not memories:
             return ""
 
@@ -174,10 +180,10 @@ class TroubleshootingRAGStore:
         return "\n".join(lines)
 
     def mark_memory_success(self, memory_ids: list[int], is_success: bool) -> None:
-        """エージェントの利用結果に基づいて評価（実績スコア）をアップデートする"""
         if not memory_ids:
             return
         from datetime import UTC, datetime
+
         with get_db_session() as db:
             mems = db.query(TroubleshootingMemory).filter(TroubleshootingMemory.id.in_(memory_ids)).all()
             for mem in mems:
@@ -187,8 +193,7 @@ class TroubleshootingRAGStore:
                     mem.fail_count += 1
                 mem.last_used_at = datetime.now(UTC)
             db.commit()
-            self._is_loaded = False  # 次回の検索時にスコアを再計算させる
+            self._is_loaded = False
 
 
-# シングルトンインスタンス
 rag_store = TroubleshootingRAGStore()
