@@ -119,7 +119,6 @@ def _sync_init_session_state(session_id: int) -> tuple[dict[str, Any] | None, li
         if not session:
             return None, [], 0
 
-        # 個別ディレクトリの生成を廃止し、全体共有の workspace_dir を常に使用
         project_path = get_workspace_dir()
         session.project_dir = str(project_path)
 
@@ -211,6 +210,7 @@ async def _inject_rag_hint_on_error(
 
 async def _request_llm_with_metrics(
     messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
     step: int,
     objective: str,
     raw_history: list[dict[str, Any]],
@@ -237,7 +237,7 @@ async def _request_llm_with_metrics(
 
         try:
             response_msg = await chat_with_tools(
-                working_messages, tools=AVAILABLE_TOOLS, role=role, model=model_name
+                working_messages, tools=tools, role=role, model=model_name
             )
 
             coding_model = get_model_for_role("coding")
@@ -256,7 +256,7 @@ async def _request_llm_with_metrics(
                             status=f"Escalating to Coder [{model_name}]...",
                         )
                     response_msg = await chat_with_tools(
-                        working_messages, tools=AVAILABLE_TOOLS, role="coding", model=coding_model
+                        working_messages, tools=tools, role="coding", model=coding_model
                     )
 
             latency = time.perf_counter() - start_t
@@ -355,6 +355,7 @@ async def run_agent_loop(
     max_steps: int | None = None,
     dashboard_callback: Callable | None = None,
     human_ask_callback: Callable | None = None,
+    infinity_mode: bool = False,
 ) -> str:
     if max_steps is None:
         max_steps = get_max_steps()
@@ -363,6 +364,8 @@ async def run_agent_loop(
     final_result = f"Reached maximum allowed steps ({max_steps}) without calling finish_task."
     used_rag_ids: set[int] = set()
     qa_rejection_count = 0
+
+    active_tools = [t for t in AVAILABLE_TOOLS if t["function"]["name"] != "finish_task"] if infinity_mode else AVAILABLE_TOOLS
 
     try:
         sess_info, raw_history, last_step = await asyncio.to_thread(_sync_init_session_state, session_id)
@@ -400,7 +403,14 @@ async def run_agent_loop(
         pending_rag_labels = [f"[{m.category}] (ID:{m.id})" for m in initial_memories]
 
         system_content = AGENT_SYSTEM_PROMPT
-        if sess_info["is_forum"]:
+        
+        if infinity_mode:
+            system_content += (
+                "\n\n[Infinity Mode Directive]: The 'finish_task' tool has been removed. You operate in an infinite loop. "
+                "When you complete a task or need new directions, you MUST use 'ask_human' to report progress and ask the user what to do next. "
+                "Never attempt to call 'finish_task'."
+            )
+        elif sess_info["is_forum"]:
             system_content += (
                 "\n\n[Forum Mode Directive]: You are operating in a persistent discussion thread. "
                 "Do NOT use 'finish_task' unless explicitly requested to close the project. "
@@ -430,6 +440,7 @@ async def run_agent_loop(
 
             response_msg, latency_sec, retries, selected_role, selected_model = await _request_llm_with_metrics(
                 messages=prompt_messages,
+                tools=active_tools,
                 step=step,
                 objective=objective,
                 raw_history=raw_history,
@@ -439,7 +450,7 @@ async def run_agent_loop(
             actual_usage = response_msg.pop("_usage", None)
             response_msg.pop("_model_used", None)
 
-            log_token_usage(step, max_steps, session_id, prompt_messages, AVAILABLE_TOOLS, actual_usage)
+            log_token_usage(step, max_steps, session_id, prompt_messages, active_tools, actual_usage)
 
             content = (response_msg.get("content") or "").strip()
             tool_calls = response_msg.get("tool_calls")
@@ -466,7 +477,7 @@ async def run_agent_loop(
                     response_msg["tool_calls"] = tool_calls
 
             inference_telemetry = session_logger.build_inference_telemetry(
-                prompt_messages, AVAILABLE_TOOLS, actual_usage, latency_sec, retries, dispatch_mode, content
+                prompt_messages, active_tools, actual_usage, latency_sec, retries, dispatch_mode, content
             )
             step_record = StepLogRecord(
                 step=step,
@@ -527,8 +538,13 @@ async def run_agent_loop(
 
                 tool_start_t = time.perf_counter()
 
-                if is_repeat_blocked:
+                if tool_name == "finish_task" and infinity_mode:
+                    tool_output = "Error: 'finish_task' is disabled in Infinity Mode. Use 'ask_human' instead."
+                    tool_status = "ERROR"
+                    is_repeat_blocked = False
+                elif is_repeat_blocked:
                     tool_output = f"Error: Repetitive action detected for '{tool_name}'. DO NOT repeat the exact same action. Analyze the human's response or previous error, and change your approach."
+                    tool_status = "BLOCKED_REPEAT"
                 else:
                     tool_output = await execute_tool_async(
                         tool_name,
@@ -537,12 +553,12 @@ async def run_agent_loop(
                         project_dir=project_path,
                         human_ask_callback=human_ask_callback,
                     )
+                    tool_status = _classify_tool_status(tool_output, False)
 
                 tool_duration = time.perf_counter() - tool_start_t
                 truncated_output = _truncate_output(tool_output)
-                tool_status = _classify_tool_status(tool_output, is_repeat_blocked)
 
-                if tool_name == "finish_task":
+                if tool_name == "finish_task" and not infinity_mode:
                     if qa_rejection_count >= MAX_QA_REJECTIONS:
                         approved = True
                         qa_msg = f"QA Auto-Approved (reached max QA review limit of {MAX_QA_REJECTIONS})."

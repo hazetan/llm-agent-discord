@@ -297,6 +297,7 @@ async def enqueue_agent_with_dashboard(
     objective: str,
     reply_msg_id: int | None = None,
     user_id: int | None = None,
+    infinity_mode: bool = False,
 ) -> None:
     _, _, project_dir_str = await asyncio.to_thread(_sync_get_session_info, session_id)
     if not project_dir_str:
@@ -305,9 +306,10 @@ async def enqueue_agent_with_dashboard(
     project_dir = Path(project_dir_str)
     view = AgentDashboardView(session_id, project_dir)
     WIDTH_SPACER = "ㅤ" * 45
+    mode_indicator = " (Infinity)" if infinity_mode else ""
 
     embed = discord.Embed(
-        title=f"Project Runner - Session #{session_id}",
+        title=f"Project Runner - Session #{session_id}{mode_indicator}",
         description=f"**目標**: {objective}\n{WIDTH_SPACER}",
         color=discord.Color.blue(),
         timestamp=datetime.now(UTC),
@@ -409,6 +411,7 @@ async def enqueue_agent_with_dashboard(
                 session_id,
                 dashboard_callback=update_dashboard,
                 human_ask_callback=human_ask_listener,
+                infinity_mode=infinity_mode,
             )
 
             embed.color = discord.Color.green()

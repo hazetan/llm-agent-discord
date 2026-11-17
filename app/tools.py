@@ -19,6 +19,7 @@ from .sandbox import (
     init_git_repo,
     is_safe_path,
     resolve_safe_workspace_file,
+    resolve_safe_workspace_dir,  # ▼ 追加
     stop_docker_container,
 )
 from .web_utils import fetch_web_page, perform_web_search
@@ -151,11 +152,13 @@ def _tool_read_file(args: dict[str, Any], workspace_dir: Path, _: int | None) ->
         return f"Error reading file: {exc}"
 
 
+# ▼ 修正: ディレクトリ解決に resolve_safe_workspace_dir を使用し、無効なパスでもエラーで落とさない
 def _tool_list_files(args: dict[str, Any], workspace_dir: Path, _: int | None) -> str:
     req_dir = str(args.get("directory", ".")).strip()
-    target_dir = (workspace_dir / req_dir).resolve()
-    if not is_safe_path(target_dir, workspace_dir) or not target_dir.exists():
-        return f"Error: Directory '{req_dir}' not found."
+    target_dir = resolve_safe_workspace_dir(req_dir, workspace_dir)
+
+    if not target_dir or not target_dir.exists() or not target_dir.is_dir():
+        return f"Error: Directory '{req_dir}' not found or invalid."
 
     tree_lines = []
     for root, dirs, files in os.walk(target_dir):
@@ -179,7 +182,6 @@ def _tool_run_command(args: dict[str, Any], project_dir: Path, session_id: int |
     if not command:
         return "Error: Command is empty."
 
-    # 複合コマンドやヘルプ実行ではなく、明確に単体のサーバー起動コマンドである場合のみバックグラウンド化
     is_compound = any(op in command for op in ("&&", "||", ";", "|", "&", "nohup"))
     is_help_or_check = any(flag in command for flag in ("--help", "-h", "--version", "-c"))
     if not is_compound and not is_help_or_check and _BLOCKING_SERVER_PATTERN.match(command):

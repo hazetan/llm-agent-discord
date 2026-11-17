@@ -242,8 +242,7 @@ async def set_model_cmd(ctx: commands.Context, role: str, model_name: str = "") 
     await ctx.reply(msg)
 
 
-@bot.command(name="run")
-async def start_task(ctx: commands.Context, *, objective: str) -> None:
+async def _handle_run_command(ctx: commands.Context, objective: str, infinity_mode: bool) -> None:
     async with ctx.typing():
         target_session_id = await _find_related_session_id(ctx.channel, objective)
 
@@ -265,7 +264,7 @@ async def start_task(ctx: commands.Context, *, objective: str) -> None:
                     )
                     asyncio.create_task(
                         enqueue_agent_with_dashboard(
-                            ctx.channel, target_session_id, info["objective"], reply_msg_id=ctx.message.id, user_id=ctx.author.id
+                            ctx.channel, target_session_id, info["objective"], reply_msg_id=ctx.message.id, user_id=ctx.author.id, infinity_mode=infinity_mode
                         )
                     )
                 return
@@ -278,10 +277,21 @@ async def start_task(ctx: commands.Context, *, objective: str) -> None:
             isinstance(ctx.channel, discord.Thread),
         )
 
-    await ctx.reply(f"{display_name} にてセッション #{session_id} を開始します！")
+    mode_str = " (Infinity Mode)" if infinity_mode else ""
+    await ctx.reply(f"{display_name} にてセッション #{session_id} を開始します！{mode_str}")
     await enqueue_agent_with_dashboard(
-        ctx.channel, session_id, objective, reply_msg_id=ctx.message.id, user_id=ctx.author.id
+        ctx.channel, session_id, objective, reply_msg_id=ctx.message.id, user_id=ctx.author.id, infinity_mode=infinity_mode
     )
+
+
+@bot.command(name="run")
+async def start_task(ctx: commands.Context, *, objective: str) -> None:
+    await _handle_run_command(ctx, objective, False)
+
+
+@bot.command(name="run_infinity")
+async def start_task_infinity(ctx: commands.Context, *, objective: str) -> None:
+    await _handle_run_command(ctx, objective, True)
 
 
 @bot.command(name="stop")
@@ -457,7 +467,6 @@ async def on_message(message: discord.Message) -> None:
 
                 context_str = f"【直近のチャット履歴】\n{history_text}\n\n" if history_text else ""
 
-                # ▼ 修正: TASKとCHATの定義をより厳格にし、迷ったら必ずTASK（作業）になるように倒す
                 intent_choices = {
                     "TASK": (
                         "ファイル操作、コード生成、コマンド実行、ファイルの検索、「作業を行って」「続きをやって」「探して」など、"
@@ -472,7 +481,7 @@ async def on_message(message: discord.Message) -> None:
                     state_text=f"{context_str}【今回のユーザーの発言】: {clean_prompt}",
                     question="ユーザーの意図が、エージェントを動かして作業させる依頼(TASK)か、それとも単なる進捗確認や対話(CHAT)かを判定してください。迷った場合はTASKを選択してください。",
                     choices=intent_choices,
-                    default_choice="TASK",  # デフォルトをTASKに変更
+                    default_choice="TASK",
                 )
 
                 if intent == "TASK":

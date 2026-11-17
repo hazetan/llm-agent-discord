@@ -61,6 +61,25 @@ def resolve_safe_workspace_file(filename: str, workspace_dir: Path) -> Path | No
     return target_file if is_safe_path(target_file, workspace_dir) else None
 
 
+# ▼ 追加: ディレクトリ用のパス解決関数（冗長なプレフィックスを取り除く）
+def resolve_safe_workspace_dir(dirname: str, workspace_dir: Path) -> Path | None:
+    clean_name = dirname.strip().replace("~/", "").lstrip("/")
+    redundant_prefixes = [
+        str(workspace_dir).lstrip("/"),
+        str(get_workspace_dir()).lstrip("/"),
+        "workspace/",
+    ]
+    for prefix in redundant_prefixes:
+        if clean_name.startswith(prefix):
+            clean_name = clean_name[len(prefix) :].lstrip("/")
+
+    if not clean_name or clean_name == ".":
+        return workspace_dir
+
+    target_dir = (workspace_dir / clean_name).resolve()
+    return target_dir if is_safe_path(target_dir, workspace_dir) else None
+
+
 def get_target_workspace(
     session_id: int | None = None,
     base_dir: Path | None = None,
