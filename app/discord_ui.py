@@ -12,19 +12,18 @@ from .agent_runner import add_session_intervention, run_agent_loop
 from .db_models import GoalSession
 from .db_system import get_db_session
 from .sandbox import IGNORE_PATTERNS, package_project_to_zip
-from .secrets import get_projects_dir
+from .secrets import get_workspace_dir
 from .task_queue import agent_task_queue
 
 pending_human_questions: dict[int, asyncio.Future] = {}
 
 MAX_DISCORD_MSG_LEN = 1900
 MAX_ZIP_BYTES = 25 * 1024 * 1024
-DASHBOARD_EDIT_INTERVAL = 2.5  # Rate Limit (5回/5秒) を確実に回避する安全間隔
+DASHBOARD_EDIT_INTERVAL = 2.5
 HUMAN_ASK_TIMEOUT_SEC = 600
 
 
 def _split_markdown_safe(text: str, max_len: int = MAX_DISCORD_MSG_LEN) -> list[str]:
-    """コードブロックや改行構造を維持したまま安全にメッセージを分割する"""
     if len(text) <= max_len:
         return [text]
 
@@ -35,7 +34,6 @@ def _split_markdown_safe(text: str, max_len: int = MAX_DISCORD_MSG_LEN) -> list[
     code_fence_header = "```"
 
     for line in text.splitlines(keepends=True):
-        # 1行自体が max_len を超える場合の強制分割
         while len(line) > max_len - 50:
             part = line[: max_len - 50]
             line = line[max_len - 50 :]
@@ -302,7 +300,7 @@ async def enqueue_agent_with_dashboard(
 ) -> None:
     _, _, project_dir_str = await asyncio.to_thread(_sync_get_session_info, session_id)
     if not project_dir_str:
-        project_dir_str = str(get_projects_dir() / f"session_{session_id}")
+        project_dir_str = str(get_workspace_dir())
 
     project_dir = Path(project_dir_str)
     view = AgentDashboardView(session_id, project_dir)
@@ -344,7 +342,6 @@ async def enqueue_agent_with_dashboard(
     ) -> None:
         nonlocal last_edit_time
         now = time.monotonic()
-        # 完了以外の高頻度な更新はスリープせずに間引く（エージェントの足を引っ張らない＋429回避）
         if now - last_edit_time < DASHBOARD_EDIT_INTERVAL and "Completed" not in status:
             return
 

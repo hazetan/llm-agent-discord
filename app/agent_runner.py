@@ -22,7 +22,6 @@ from .rag_store import rag_store
 from .secrets import (
     get_max_output_chars,
     get_max_steps,
-    get_projects_dir,
     get_prompt_token_limit,
     get_workspace_dir,
 )
@@ -120,11 +119,9 @@ def _sync_init_session_state(session_id: int) -> tuple[dict[str, Any] | None, li
         if not session:
             return None, [], 0
 
-        if not session.project_dir:
-            project_path = get_projects_dir() / f"session_{session.id}"
-            session.project_dir = str(project_path)
-        else:
-            project_path = Path(session.project_dir)
+        # 個別ディレクトリの生成を廃止し、全体共有の workspace_dir を常に使用
+        project_path = get_workspace_dir()
+        session.project_dir = str(project_path)
 
         project_path.mkdir(parents=True, exist_ok=True)
         init_git_repo(project_path)
@@ -410,18 +407,6 @@ async def run_agent_loop(
                 "Use 'ask_human' to report progress and ask for next instructions."
             )
 
-        if project_path == get_workspace_dir():
-            try:
-                subdirs = [
-                    d for d in os.listdir(project_path)
-                    if os.path.isdir(project_path / d) and not d.startswith(".")
-                ]
-                if subdirs:
-                    system_content += f"\n\n[Workspace Root Hint]: Directories here: {', '.join(subdirs)}."
-            except Exception:
-                pass
-
-        # ▼ 修正: 複数ステップ・複数ツールにまたがる堅牢な反復トラッキング辞書
         signature_repeat_counts: dict[str, int] = {}
 
         for step in range(1, max_steps + 1):
@@ -528,7 +513,6 @@ async def run_agent_loop(
                 signature_repeat_counts[current_sig] = signature_repeat_counts.get(current_sig, 0) + 1
                 current_step_signatures.add(current_sig)
                 
-                # ▼ 修正: 2回目（1回目の重複）で即座にブロックし、無駄なユーザー問合せやコマンド実行を阻止する
                 is_repeat_blocked = signature_repeat_counts[current_sig] >= 2
 
                 if dashboard_callback:
@@ -630,7 +614,6 @@ async def run_agent_loop(
                 pending_rag_labels.extend(hits)
                 used_rag_ids.update(mem_ids)
                 
-            # 次のステップのために、今回呼ばれたシグネチャのカウントのみを残す（別のツールに切り替えたらリセットされる）
             signature_repeat_counts = {k: v for k, v in signature_repeat_counts.items() if k in current_step_signatures}
 
             await asyncio.to_thread(session_logger.log_step, step_record)

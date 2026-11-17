@@ -20,7 +20,6 @@ from .secrets import (
     get_docker_hosts,
     get_docker_image,
     get_docker_mem_limit,
-    get_projects_dir,
     get_workspace_dir,
 )
 
@@ -77,10 +76,6 @@ def get_target_workspace(
                 project_path.mkdir(parents=True, exist_ok=True)
                 return project_path
 
-        fallback_path = get_projects_dir() / f"session_{session_id}"
-        fallback_path.mkdir(parents=True, exist_ok=True)
-        return fallback_path
-
     return get_workspace_dir()
 
 
@@ -99,8 +94,6 @@ def package_project_to_zip(project_dir: Path, session_id: int) -> Path:
 
 
 class DockerSandboxManager:
-    """Docker SDK / CLI を用いてコンテナを管理し、プロセス単位のタイムアウト制御を行う．"""
-
     def __init__(self) -> None:
         self._session_host_map: dict[int, str] = {}
 
@@ -216,15 +209,10 @@ class DockerSandboxManager:
     def execute_command(
         self, session_id: int | None, workspace_dir: Path, command: str
     ) -> str:
-        """
-        コンテナ内の `timeout` ユーティリティを使ってプロセスツリー単位で制限時間を設ける。
-        タイムアウト時もコンテナ自体は再起動せず、対象プロセスのみを終了させる。
-        """
         timeout_sec = get_command_timeout()
         container_name = self.ensure_container(session_id, workspace_dir)
         client = self._get_sdk_client(session_id)
 
-        # timeout コマンドでラップ (終了コード 124 または 137 がタイムアウト)
         wrapped_cmd = f"timeout -k 5 {timeout_sec}s sh -c {shlex.quote(command)}"
 
         if client is not None:
