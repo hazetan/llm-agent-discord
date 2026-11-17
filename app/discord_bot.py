@@ -457,21 +457,22 @@ async def on_message(message: discord.Message) -> None:
 
                 context_str = f"【直近のチャット履歴】\n{history_text}\n\n" if history_text else ""
 
+                # ▼ 修正: TASKとCHATの定義をより厳格にし、迷ったら必ずTASK（作業）になるように倒す
                 intent_choices = {
                     "TASK": (
-                        "ファイル作成・編集、コード生成、バグ修正、コマンド実行、「続きをやって」など、"
-                        "実際にワークスペースのファイルを操作したり、エージェントを動かす作業依頼。"
+                        "ファイル操作、コード生成、コマンド実行、ファイルの検索、「作業を行って」「続きをやって」「探して」など、"
+                        "エージェントに具体的な作業や行動を要求する指示。"
                     ),
                     "CHAT": (
-                        "現在のプロジェクトの進捗確認、状況の質問、技術的な相談、プレゼン作成、"
-                        "単なる挨拶や雑談など、ワークスペースの変更を伴わない対話。"
+                        "進捗状況の確認、技術的な質問、純粋な雑談や挨拶など、"
+                        "エージェントを動かして作業させる必要のない対話。"
                     ),
                 }
                 intent = await decide_with_d1(
                     state_text=f"{context_str}【今回のユーザーの発言】: {clean_prompt}",
-                    question="ユーザーの意図が、実際にファイルを操作する作業依頼(TASK)か、それとも進捗確認や対話(CHAT)かを判定してください。進捗確認はCHATになります。",
+                    question="ユーザーの意図が、エージェントを動かして作業させる依頼(TASK)か、それとも単なる進捗確認や対話(CHAT)かを判定してください。迷った場合はTASKを選択してください。",
                     choices=intent_choices,
-                    default_choice="CHAT",
+                    default_choice="TASK",  # デフォルトをTASKに変更
                 )
 
                 if intent == "TASK":

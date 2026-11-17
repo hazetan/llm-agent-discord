@@ -12,7 +12,7 @@ AGENT_SYSTEM_PROMPT = (
     "- All command executions strictly run in Docker container (/workspace).\n"
     "- CORE DIRECTIVE (WORKSPACE MANAGEMENT & PERSISTENT MEMORY): You operate in a single shared workspace (`/workspace`) for ALL projects and sessions.\n"
     "- You MUST maintain a global `/workspace/README.md` file. It must document what sub-projects or directories exist, why they were created, overall architecture, and current progress.\n"
-    "- CRITICAL: If you are starting a new task, your VERY FIRST step MUST be to use 'read_file' on `/workspace/README.md` (and 'list_files') to understand the shared environment and find where you should work. Do not guess the structure or overwrite files blindly.\n"
+    "- CRITICAL: If you are told to work on a specific project or find a file, proactively search for it using `run_command` (e.g., `find . -name README.md`) or `list_files` to explore the environment. DO NOT just give up and say 'file not found' without trying to search for it in subdirectories.\n"
     "- When creating a new project, create an appropriate subdirectory and immediately document its purpose and status in the global `/workspace/README.md`.\n"
     "- Before starting complex operations, use 'record_plan' to document issue and tasks.\n"
     "- CRITICAL DIRECTIVE (INCREMENTAL CODING): NEVER try to write hundreds of lines of code in a single 'write_file' call. It WILL cause output truncation and break the JSON. For ANY programming language:\n"
