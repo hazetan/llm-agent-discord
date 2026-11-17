@@ -20,9 +20,7 @@ from .secrets import (
     get_Sampling_config,
 )
 
-# 実行時に Discord コマンド (!set_model) から変更可能なオーバーライド辞書
 _RUNTIME_ROLE_OVERRIDES: dict[str, str] = {}
-# 特定モデルへの強制ロック用 (None なら自動切り替えモード)
 _LOCKED_MODEL: str | None = None
 
 ROLE_DESCRIPTIONS: dict[str, str] = {
@@ -36,13 +34,12 @@ ROLE_DESCRIPTIONS: dict[str, str] = {
 }
 
 ERROR_KEYWORDS: tuple[str, ...] = (
-    "error", "exception", "traceback", "failed",
+    "error:", "exception:", "traceback", "failed",
     "permission denied", "not found", "timed out", "syntaxerror", "typeerror",
 )
 
 
 def get_all_role_models() -> dict[str, str]:
-    """現在の全ロールとモデル名の対応辞書を返す．"""
     defaults = {
         "decision": get_model_decision(),
         "coding": get_model_coding(),
@@ -57,7 +54,6 @@ def get_all_role_models() -> dict[str, str]:
 
 
 def get_model_for_role(role: str) -> str:
-    """指定されたロールに対応するモデル名を返す．ロック中ならロックされたモデルを返す．"""
     if _LOCKED_MODEL:
         return _LOCKED_MODEL
     models = get_all_role_models()
@@ -65,7 +61,6 @@ def get_model_for_role(role: str) -> str:
 
 
 def set_model_for_role(role: str, model_name: str) -> str:
-    """実行時にロールの割り当てモデルまたはロック設定を変更する．"""
     global _LOCKED_MODEL
     role_key = role.strip().lower()
     if role_key == "auto":
@@ -87,7 +82,6 @@ def get_locked_model() -> str | None:
 
 
 async def fetch_available_ollama_models() -> list[dict[str, Any]]:
-    """Ollama の /api/tags から利用可能なモデル一覧を取得する．"""
     timeout = aiohttp.ClientTimeout(total=10)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -100,16 +94,38 @@ async def fetch_available_ollama_models() -> list[dict[str, Any]]:
     return []
 
 
-# --- LFM3 / Qwen 思考タグ除去 & 多形式ツールコールパーサー ---
 def strip_thinking_tokens(text: str) -> str:
-    """LFM3 等が出力する <think>...</think> タグを除去する．"""
     if not text:
         return ""
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    # 閉じタグが切れている場合のケア
     if "<think>" in cleaned and "</think>" not in cleaned:
         cleaned = cleaned.split("<think>")[0]
     return cleaned.strip()
+
+
+def _try_parse_json_lenient(raw_str: str) -> Any | None:
+    """末尾カンマやコードブロックの混入など軽微なJSON破損を修復してパースする"""
+    s = raw_str.strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # 末尾カンマの除去
+    s_fixed = re.sub(r",\s*([}\]])", r"\1", s)
+    try:
+        return json.loads(s_fixed)
+    except Exception:
+        pass
+
+    # Python リテラルとして評価可能な場合 (シングルクォート辞書など)
+    try:
+        val = ast.literal_eval(s)
+        if isinstance(val, (dict, list)):
+            return val
+    except Exception:
+        pass
+    return None
 
 
 def _coerce_param_value(raw_val: str) -> Any:
@@ -131,18 +147,16 @@ def _coerce_param_value(raw_val: str) -> Any:
         except Exception:
             pass
     if (val.startswith("{") and val.endswith("}")) or (val.startswith("[") and val.endswith("]")):
-        try:
-            return json.loads(val)
-        except Exception:
-            pass
+        parsed = _try_parse_json_lenient(val)
+        if parsed is not None:
+            return parsed
     return val
 
 
 def parse_any_tool_calls(content: str) -> list[dict[str, Any]]:
     """
-    LFM3 の XML 形式 (<tool_call><function=name><parameter=k>v</parameter></function></tool_call>)、
-    LFM2.5 の特殊トークン形式 (<|tool_call_start|>...<|tool_call_end|>)、
-    または JSON 形式のツール呼び出しを検出し、OpenAI 互換の tool_calls リストに変換する．
+    LFM3 XML 形式、特殊トークン形式、または JSON 形式のツール呼び出しを安全に抽出する．
+    HTMLコード等がパラメータに含まれていても壊れないよう境界判定を厳密化．
     """
     if not content:
         return []
@@ -150,12 +164,13 @@ def parse_any_tool_calls(content: str) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
     call_idx = 1
 
-    # 1. LFM3 XML 形式: <tool_call><function=NAME><parameter=KEY>VAL</parameter></function></tool_call>
+    # 1. LFM3 XML 形式: 次の <parameter=...> または </function> が来るまでを1つのパラメータ値として抽出
     xml_func_pattern = re.compile(
         r"<function=([a-zA-Z0-9_]+)>(.*?)</function>", re.DOTALL
     )
     param_pattern = re.compile(
-        r"<parameter=([a-zA-Z0-9_]+)>(.*?)</parameter>", re.DOTALL
+        r"<parameter=([a-zA-Z0-9_]+)>(.*?)</parameter>(?=\s*(?:<parameter=|<\/function>|$))",
+        re.DOTALL,
     )
     for func_match in xml_func_pattern.finditer(content):
         func_name = func_match.group(1).strip()
@@ -164,12 +179,13 @@ def parse_any_tool_calls(content: str) -> list[dict[str, Any]]:
         for p_match in param_pattern.finditer(func_body):
             p_key = p_match.group(1).strip()
             p_val = p_match.group(2)
-            # 先頭と末尾の単一改行のみ除去（コード内のインデント等は維持）
             if p_val.startswith("\n"):
                 p_val = p_val[1:]
             if p_val.endswith("\n"):
                 p_val = p_val[:-1]
-            args_dict[p_key] = _coerce_param_value(p_val) if p_key != "content" else p_val
+            args_dict[p_key] = (
+                p_val if p_key in ("content", "old_text", "new_text") else _coerce_param_value(p_val)
+            )
 
         calls.append({
             "id": f"lfm_xml_call_{call_idx}",
@@ -192,9 +208,8 @@ def parse_any_tool_calls(content: str) -> list[dict[str, Any]]:
     )
     for block in tag_blocks:
         block_str = block.strip()
-        # JSON 形式の場合
-        try:
-            parsed = json.loads(block_str)
+        parsed = _try_parse_json_lenient(block_str)
+        if parsed is not None:
             items = parsed if isinstance(parsed, list) else [parsed]
             for item in items:
                 if isinstance(item, dict) and "name" in item:
@@ -209,8 +224,6 @@ def parse_any_tool_calls(content: str) -> list[dict[str, Any]]:
                     call_idx += 1
             if calls:
                 return calls
-        except Exception:
-            pass
 
         # Pythonic 形式: [run_command(command="ls -la")]
         py_inner = block_str.strip("[]").strip()
@@ -219,10 +232,11 @@ def parse_any_tool_calls(content: str) -> list[dict[str, Any]]:
                 tree = ast.parse(py_inner, mode="eval")
                 if isinstance(tree.body, ast.Call) and isinstance(tree.body.func, ast.Name):
                     fn_name = tree.body.func.id
-                    kw_args = {}
-                    for kw in tree.body.keywords:
-                        if kw.arg:
-                            kw_args[kw.arg] = ast.literal_eval(kw.value)
+                    kw_args = {
+                        kw.arg: ast.literal_eval(kw.value)
+                        for kw in tree.body.keywords
+                        if kw.arg
+                    }
                     calls.append({
                         "id": f"py_call_{call_idx}",
                         "type": "function",
@@ -242,28 +256,21 @@ def parse_any_tool_calls(content: str) -> list[dict[str, Any]]:
     md_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
     candidate_str = md_match.group(1) if md_match else content.strip()
     if candidate_str.startswith("{") and candidate_str.endswith("}"):
-        try:
-            data = json.loads(candidate_str)
-            if isinstance(data, dict) and "name" in data and ("arguments" in data or "args" in data):
-                raw_args = data.get("arguments", data.get("args", {}))
-                if not isinstance(raw_args, str):
-                    raw_args = json.dumps(raw_args, ensure_ascii=False)
-                calls.append({
-                    "id": f"fallback_json_{call_idx}",
-                    "type": "function",
-                    "function": {"name": data["name"], "arguments": raw_args},
-                })
-        except Exception:
-            pass
+        data = _try_parse_json_lenient(candidate_str)
+        if isinstance(data, dict) and "name" in data and ("arguments" in data or "args" in data):
+            raw_args = data.get("arguments", data.get("args", {}))
+            if not isinstance(raw_args, str):
+                raw_args = json.dumps(raw_args, ensure_ascii=False)
+            calls.append({
+                "id": f"fallback_json_{call_idx}",
+                "type": "function",
+                "function": {"name": data["name"], "arguments": raw_args},
+            })
 
     return calls
 
 
 def _sanitize_messages_for_ollama(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    異なるモデル間で会話履歴を引き継ぐ際、テンプレートエラーを防ぐため
-    content=None の空文字化や過去の不要な <think> タグ除去を行う．
-    """
     sanitized: list[dict[str, Any]] = []
     for msg in messages:
         new_msg = dict(msg)
@@ -293,7 +300,6 @@ def _sanitize_messages_for_ollama(messages: list[dict[str, Any]]) -> list[dict[s
 
 
 async def _post_completion(payload: dict[str, Any]) -> dict[str, Any]:
-    """Ollama の /v1/chat/completions へリクエストを送信し、正規化した message を返す．"""
     client_timeout = aiohttp.ClientTimeout(total=get_llm_timeout())
     model_name = payload.get("model", get_model_for_role("light_work"))
     payload["model"] = model_name
@@ -317,12 +323,10 @@ async def _post_completion(payload: dict[str, Any]) -> dict[str, Any]:
             message = data["choices"][0]["message"]
             raw_content = message.get("content") or ""
 
-            # ツール呼び出しが content 側に XML や JSON で出力された場合を自動救済
             if not message.get("tool_calls") and raw_content:
                 extracted_calls = parse_any_tool_calls(raw_content)
                 if extracted_calls:
                     message["tool_calls"] = extracted_calls
-                    # ツールタグ部分を本文から除去
                     cleaned_text = re.sub(
                         r"<tool_call>.*?</tool_call>|<\|tool_call_start\|>.*?<\|tool_call_end\|>",
                         "",
@@ -348,7 +352,6 @@ async def ask_llm(
     role: str = "light_work",
     model: str | None = None,
 ) -> str:
-    """単発チャット・作業用応答（デフォルトは軽量高速な light_work モデルを使用）．"""
     target_model = model or get_model_for_role(role)
     payload: dict[str, Any] = {
         "model": target_model,
@@ -364,7 +367,6 @@ async def ask_llm(
         message = await _post_completion(payload)
         content = (message.get("content") or "").strip()
         if not content and role == "decision":
-            # 万が一 decision モデルが空文字を返した場合は light_work モデルでフォールバック
             fb_model = get_model_for_role("light_work")
             if fb_model != target_model:
                 payload["model"] = fb_model
@@ -381,10 +383,6 @@ async def decide_with_d1(
     choices: dict[str, str],
     default_choice: str = "",
 ) -> str:
-    """
-    判断用モデル (d1-2B:Q4_K_M) を用いて、選択肢 (choices) の中から最も適切なキーを高速判定する．
-    万が一 d1-2B で判定ラベルが得られなかった場合は light_work (LFM3-1.7B:Q4_K_M) に自動フォールバックする．
-    """
     choice_keys = list(choices.keys())
     if not default_choice and choice_keys:
         default_choice = choice_keys[0]
@@ -430,22 +428,15 @@ async def select_optimal_model_for_step(
     raw_history: list[dict[str, Any]],
     retry_attempt: int = 0,
 ) -> tuple[str, str]:
-    """
-    エージェントループの各ステップにおいて、現在の文脈から最適な (role, model_name) を自律決定する．
-    """
-    # 1. 手動ロック時
     if _LOCKED_MODEL:
         return "locked", _LOCKED_MODEL
 
-    # 2. リトライ発生時は確実性を最優先してコーディング用大型モデル (Qwen2.5-Coder-14B) に昇格
     if retry_attempt > 0:
         return "coding", get_model_for_role("coding")
 
-    # 3. 初回ステップ (Step 1) はワークスペースのファイル探索 (list_files / read_file) から始めるため system_cmd
     if step == 1 or not raw_history:
         return "system_cmd", get_model_for_role("system_cmd")
 
-    # 直近の履歴を分析
     recent_msgs = raw_history[-4:]
     recent_summary_lines = []
     last_tool_name = ""
@@ -468,11 +459,9 @@ async def select_optimal_model_for_step(
         elif r == "user":
             recent_summary_lines.append(f"User: {c}")
 
-    # 4. 直前のツール実行でエラーが発生していた場合は、原因分析と修正のため coding モデルを選択
     if last_tool_had_error:
         return "coding", get_model_for_role("coding")
 
-    # 5. 画像や音声モダリティのキーワードが含まれる場合の特殊ルーティング
     combined_recent = "\n".join(recent_summary_lines).lower()
     if any(ext in combined_recent for ext in (".png", ".jpg", ".jpeg", ".webp", "image", "画像")):
         if " inspect " in combined_recent or "vision" in combined_recent:
@@ -480,7 +469,6 @@ async def select_optimal_model_for_step(
     if any(ext in combined_recent for ext in (".wav", ".mp3", ".ogg", "audio", "音声")):
         return "audio", get_model_for_role("audio")
 
-    # 6. 判断モデル (d1-2B:Q4_K_M) による次ステップのフェーズ判定
     state_text = (
         f"Objective: {objective[:300]}\n"
         f"Current Step: {step}\n"
@@ -502,7 +490,6 @@ async def select_optimal_model_for_step(
         ),
     }
 
-    # ヒューリスティックな初期デフォルト（read_file や list_files の直後は CODING になりやすい）
     default_phase = "CODING" if last_tool_name in ("read_file", "list_files", "record_plan") else "SYSTEM_CMD"
     chosen = await decide_with_d1(
         state_text=state_text,
@@ -527,7 +514,6 @@ async def chat_with_tools(
     role: str = "coding",
     model: str | None = None,
 ) -> dict[str, Any]:
-    """指定されたロールまたはモデルを用いて Function Calling 推論を実行する．"""
     target_model = model or get_model_for_role(role)
     clean_messages = _sanitize_messages_for_ollama(messages)
 

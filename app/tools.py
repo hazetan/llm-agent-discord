@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -168,17 +169,25 @@ def _tool_list_files(args: dict[str, Any], workspace_dir: Path, _: int | None) -
     return "\n".join(tree_lines) if tree_lines else "(directory is empty)"
 
 
+_BLOCKING_SERVER_PATTERN = re.compile(
+    r"^\s*(?:python3?\s+-m\s+http\.server|flask\s+run|uvicorn\s+\S+|npm\s+run\s+(?:dev|start))\b"
+)
+
+
 def _tool_run_command(args: dict[str, Any], project_dir: Path, session_id: int | None) -> str:
     command = args.get("command", "").strip()
     if not command:
         return "Error: Command is empty."
 
-    # ▼ 追加: サーバー起動コマンドのブロック回避インターセプタ
-    server_keywords = ["flask run", "python app.py", "python main.py", "uvicorn"]
-    if any(k in command for k in server_keywords) and "&" not in command and "nohup" not in command:
-        # 強制的にバックグラウンド実行に書き換え、1秒待ってから状態を確認する
-        command = f"nohup {command} > /tmp/server.log 2>&1 & sleep 1; echo 'Server started in background (PID: $!). Log: /tmp/server.log'"
-    
+    # 複合コマンドやヘルプ実行ではなく、明確に単体のサーバー起動コマンドである場合のみバックグラウンド化
+    is_compound = any(op in command for op in ("&&", "||", ";", "|", "&", "nohup"))
+    is_help_or_check = any(flag in command for flag in ("--help", "-h", "--version", "-c"))
+    if not is_compound and not is_help_or_check and _BLOCKING_SERVER_PATTERN.match(command):
+        command = (
+            f"nohup {command} > /tmp/server.log 2>&1 & "
+            "sleep 2; echo \"Server started in background (PID: $!). Recent logs:\"; tail -n 20 /tmp/server.log"
+        )
+
     return exec_in_docker(session_id, project_dir, command)
 
 
@@ -246,7 +255,6 @@ def _tool_update_plan_result(
 def _tool_record_troubleshooting(
     args: dict[str, Any], _: Path, __: int | None
 ) -> str:
-    """エラー解決の知見を Embedding ベクトル付きで RAG ストアへ登録する．"""
     try:
         memo_id = rag_store.add_memory_sync(
             category=str(args.get("category", "general")),
@@ -288,7 +296,7 @@ async def execute_tool_async(
     project_dir: Path | None = None,
     human_ask_callback: Callable | None = None,
 ) -> str:
-    workspace_dir = get_target_workspace(session_id, project_dir)
+    workspace_dir = await asyncio.to_thread(get_target_workspace, session_id, project_dir)
     safe_args = args or {}
 
     if name == "ask_human":

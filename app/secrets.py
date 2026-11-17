@@ -9,7 +9,6 @@ ENV_PATH = BASE_DIR / ".env"
 
 
 def reload_env() -> None:
-    """常に最新の .env 設定を反映する．"""
     load_dotenv(dotenv_path=ENV_PATH, override=True)
 
 
@@ -48,13 +47,11 @@ def _get_bool(key: str, default: bool = True) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-# --- 認証・Ollama エンドポイント設定 ---
 def load_token() -> str:
     return _get_str("DISCORD_TOKEN", "")
 
 
 def get_ollama_base_url() -> str:
-    """Ollama サーバーのベース URL (例: http://192.168.1.10:11434) を返す．"""
     base = _get_str("OLLAMA_BASE_URL", "") or _get_str("OLLAMA_HOST", "")
     if not base:
         legacy = _get_str("LLAMA_SERVER_URL", "")
@@ -72,22 +69,18 @@ def get_ollama_base_url() -> str:
 
 
 def get_llama_server_url() -> str:
-    """OpenAI 互換の Chat Completions エンドポイントを返す．"""
     return f"{get_ollama_base_url()}/v1/chat/completions"
 
 
 def get_ollama_api_chat_url() -> str:
-    """Ollama ネイティブの /api/chat エンドポイントを返す．"""
     return f"{get_ollama_base_url()}/api/chat"
 
 
 def get_ollama_tags_url() -> str:
-    """Ollama の利用可能モデル一覧取得エンドポイント (/api/tags) を返す．"""
     return f"{get_ollama_base_url()}/api/tags"
 
 
 def get_ollama_systemone_url() -> str:
-    """Liquid AI d1 モデル用の意思決定エンドポイント (/v1/systemone) を返す．"""
     return f"{get_ollama_base_url()}/v1/systemone"
 
 
@@ -98,48 +91,38 @@ def get_llama_embedding_url() -> str:
     return f"{get_ollama_base_url()}/v1/embeddings"
 
 
-# --- ロール別モデル設定 (Ollama) ---
 def get_model_decision() -> str:
-    """判断・意図分類・ルーティング用モデル"""
     return _get_str("MODEL_DECISION", "d1-2B:Q4_K_M")
 
 
 def get_model_coding() -> str:
-    """コーディング・設計・複雑な推論・デバッグ用モデル"""
     return _get_str("MODEL_CODING", "Qwen2.5-Coder-14B-Instruct:Q4_K_M")
 
 
 def get_model_system_cmd() -> str:
-    """システムコマンド実行・ファイル探索・ツール呼び出し用モデル"""
     return _get_str("MODEL_SYSTEM_CMD", "LFM3-1.7B:Q8_0")
 
 
 def get_model_light_work() -> str:
-    """ちょっとした作業・要約・雑談・軽量テキスト生成用モデル"""
     return _get_str("MODEL_LIGHT_WORK", "LFM3-1.7B:Q4_K_M")
 
 
 def get_model_vision() -> str:
-    """画像・視覚理解用モデル"""
     return _get_str("MODEL_VISION", "LFM3-VL-2B:Q4_K_M")
 
 
 def get_model_audio() -> str:
-    """音声処理用モデル"""
     return _get_str("MODEL_AUDIO", "LFM3-Audio-2B:Q4_K_M")
 
 
 def get_model_omni() -> str:
-    """マルチモーダル・総合対話用モデル"""
     return _get_str("MODEL_OMNI", "LFM3-Omni-2B:Q4_K_M")
 
 
 def get_ollama_keep_alive() -> str:
-    """Ollama がモデルを VRAM に保持する時間"""
     return _get_str("OLLAMA_KEEP_ALIVE", "10m")
 
 
-# --- トークン・コンテキスト動的スケーリング設定 ---
 def get_server_ctx_size() -> int:
     return _get_int("SERVER_CTX_SIZE", 32768)
 
@@ -179,7 +162,6 @@ def get_keep_recent_messages() -> int:
     return _get_int("KEEP_RECENT_MESSAGES", default_keep)
 
 
-# --- 実行制限・インフラ設定 ---
 def get_max_steps() -> int:
     return _get_int("MAX_STEPS", 512)
 
@@ -214,12 +196,10 @@ def get_rag_top_k() -> int:
 
 
 def get_Sampling_config(use_xtc: bool = False, model_name: str = "") -> dict[str, Any]:
-    """Ollama および対象モデルに最適化したサンプリングパラメータを構築して返す．"""
     lower_model = model_name.lower()
     if "d1" in lower_model:
         temp = 0.0
     elif "lfm3" in lower_model:
-        # Liquid AI LFM3 推奨の低温度設定
         temp = _get_float("LLM_TEMP_LFM3", 0.1)
     elif "qwen" in lower_model or "coder" in lower_model:
         temp = _get_float("LLM_TEMP_CODING", 0.2)
@@ -229,10 +209,12 @@ def get_Sampling_config(use_xtc: bool = False, model_name: str = "") -> dict[str
     return {
         "temperature": temp,
         "top_p": _get_float("LLM_TOP_P", 0.9),
+        # ▼ 追加: 同じテキストやトピックのループを防止するためのペナルティ設定
+        "frequency_penalty": _get_float("LLM_FREQ_PENALTY", 0.3),
+        "presence_penalty": _get_float("LLM_PRESENCE_PENALTY", 0.3),
     }
 
 
-# --- ワークスペースパス設定 ---
 def get_workspace_dir() -> Path:
     custom_ws = _get_str("WORKSPACE_DIR")
     if custom_ws:

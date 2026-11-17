@@ -4,7 +4,7 @@ from .token_monitor import estimate_item_tokens
 
 
 class ContextBuilder:
-    """LLMに送るコンテキストを、トークン上限ギリギリまで最も賢く組み立てるクラス"""
+    """LLMに送るコンテキストを、重要文脈を保護しつつトークン上限内に収めるクラス"""
 
     def __init__(self, max_prompt_tokens: int):
         self.max_prompt_tokens = max_prompt_tokens
@@ -22,37 +22,71 @@ class ContextBuilder:
         if content:
             self.rag_and_plan_blocks.append(content)
 
+    def _summarize_pruned_messages(self, pruned: list[dict[str, Any]]) -> str:
+        """切り捨てられた古いメッセージから、重要なユーザー指示と実行履歴の要約を作る"""
+        user_interventions = []
+        executed_tools = []
+
+        for m in pruned:
+            role = m.get("role", "")
+            content = str(m.get("content") or "")
+            if role == "user" and "Mid-Course Correction" in content:
+                user_interventions.append(content)
+            elif role == "tool":
+                t_name = m.get("name", "tool")
+                first_line = content.splitlines()[0][:80] if content else ""
+                executed_tools.append(f"{t_name} -> {first_line}")
+
+        summary_lines = [f"--- [Compressed Earlier History ({len(pruned)} messages pruned)] ---"]
+        if user_interventions:
+            summary_lines.append("Key User Corrections (MUST OBEY):")
+            for ui in user_interventions[-5:]:
+                summary_lines.append(f"  * {ui}")
+        if executed_tools:
+            summary_lines.append("Earlier Tool Executions (Digest):")
+            for et in executed_tools[-10:]:
+                summary_lines.append(f"  - {et}")
+        summary_lines.append("---------------------------------------------------------------")
+        return "\n".join(summary_lines)
+
     def build_messages(self, raw_history: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool, str]:
-        """トークン制限を守りつつ、LLMに渡す最終的なリストを生成し (messages, compressed, handover) を返す"""
-        messages = []
-        messages.append({"role": "system", "content": self.system_content})
-        messages.append({"role": "user", "content": f"Task Objective: {self.objective_content}"})
+        messages = [
+            {"role": "system", "content": self.system_content},
+            {"role": "user", "content": f"Task Objective: {self.objective_content}"},
+        ]
 
         handover_text = ""
         if self.rag_and_plan_blocks:
             handover_text = "\n\n".join(self.rag_and_plan_blocks)
             messages.append({"role": "system", "content": handover_text})
 
-        # 固定ブロック（System, Objective, RAG/Plan）のトークンを計算
         base_tok = estimate_item_tokens(messages)
-        
-        # 履歴に使える残り枠（最低でも1000トークンは確保）
-        available_for_history = max(1000, self.max_prompt_tokens - base_tok)
+        # ダイジェスト挿入用の予備マージン 400 トークンを引いておく
+        available_for_history = max(1200, self.max_prompt_tokens - base_tok - 400)
 
-        selected_history = []
+        selected_history: list[dict[str, Any]] = []
         current_hist_tok = 0
-        compressed = False
+        cutoff_idx = 0
 
-        # 履歴を「最新のものから」順に遡って追加していく
-        for msg in reversed(raw_history):
+        for idx in range(len(raw_history) - 1, -1, -1):
+            msg = raw_history[idx]
             msg_tok = estimate_item_tokens(msg)
-            # 枠からはみ出る場合は、それより古い記憶を打ち切る（圧縮発動）
             if current_hist_tok + msg_tok > available_for_history:
-                compressed = True
+                cutoff_idx = idx + 1
                 break
-            
             selected_history.insert(0, msg)
             current_hist_tok += msg_tok
+
+        # 先頭が孤立した role="tool" になった場合、APIエラーを防ぐため直前の assistant まで除外する
+        while selected_history and selected_history[0].get("role") == "tool":
+            selected_history.pop(0)
+            cutoff_idx += 1
+
+        compressed = cutoff_idx > 0
+        if compressed:
+            pruned_msgs = raw_history[:cutoff_idx]
+            digest_text = self._summarize_pruned_messages(pruned_msgs)
+            messages.append({"role": "system", "content": digest_text})
 
         messages.extend(selected_history)
         return messages, compressed, handover_text

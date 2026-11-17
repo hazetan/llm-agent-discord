@@ -4,13 +4,14 @@ import shutil
 import traceback
 from datetime import UTC, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import discord
 from discord.ext import commands
 
 from .agent_runner import add_session_intervention
 from .db_models import Activity, GoalSession
-from .db_system import SessionLocal, get_db_session, init_db
+from .db_system import get_db_session, init_db
 from .discord_ui import (
     enqueue_agent_with_dashboard,
     pending_human_questions,
@@ -25,7 +26,12 @@ from .llama_acc import (
     get_locked_model,
     set_model_for_role,
 )
-from .secrets import get_ollama_base_url, get_projects_dir, get_workspace_dir, load_token
+from .secrets import (
+    get_ollama_base_url,
+    get_projects_dir,
+    get_workspace_dir,
+    load_token,
+)
 from .task_queue import agent_task_queue
 
 JST = timezone(timedelta(hours=9))
@@ -33,6 +39,124 @@ JST = timezone(timedelta(hours=9))
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# --- 非同期安全な DB ヘルパー群 ---
+def _sync_get_unfinished_sessions() -> list[dict[str, Any]]:
+    with get_db_session() as db:
+        sessions = (
+            db.query(GoalSession)
+            .filter(GoalSession.status.in_(["pending", "running"]))
+            .all()
+        )
+        return [
+            {
+                "id": s.id,
+                "channel_id": s.channel_id,
+                "objective": s.objective,
+                "message_id": s.message_id,
+            }
+            for s in sessions
+        ]
+
+
+def _sync_get_recent_channel_sessions(channel_id: int, limit: int = 5) -> list[dict[str, Any]]:
+    with get_db_session() as db:
+        sessions = (
+            db.query(GoalSession)
+            .filter(GoalSession.channel_id == channel_id)
+            .order_by(GoalSession.id.desc())
+            .limit(limit)
+            .all()
+        )
+        return [{"id": s.id, "objective": s.objective} for s in sessions]
+
+
+def _sync_resume_or_intervene_session(session_id: int) -> dict[str, Any] | None:
+    with get_db_session() as db:
+        session = db.query(GoalSession).filter(GoalSession.id == session_id).first()
+        if not session:
+            return None
+        display_name = Path(session.project_dir).name if session.project_dir else f"session_{session_id}"
+        was_active = session.status in ["running", "pending"]
+        if not was_active:
+            session.status = "pending"
+            db.commit()
+        return {
+            "id": session.id,
+            "display_name": display_name,
+            "was_active": was_active,
+            "objective": session.objective,
+        }
+
+
+def _sync_create_new_session(
+    objective: str,
+    channel_id: int,
+    message_id: int,
+    clean_slug: str,
+    is_forum: bool,
+    source_path: Path | None = None,
+    use_workspace_root_on_special: bool = False,
+) -> tuple[int, str]:
+    with get_db_session() as db:
+        session = GoalSession(
+            title=objective[:30],
+            objective=objective,
+            status="pending",
+            channel_id=channel_id,
+            message_id=message_id,
+            project_slug=clean_slug,
+            is_forum=is_forum,
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        session_id = session.id
+
+        if clean_slug in ("workspaceroot", "workspace_root"):
+            proj_dir = get_workspace_dir() if use_workspace_root_on_special else get_projects_dir()
+            display_name = "全体のワークスペース"
+        else:
+            proj_dir = get_projects_dir() / clean_slug
+            if source_path is not None:
+                shutil.copytree(source_path, proj_dir, dirs_exist_ok=True)
+            else:
+                proj_dir.mkdir(parents=True, exist_ok=True)
+            display_name = clean_slug
+
+        session.project_dir = str(proj_dir)
+        db.commit()
+        return session_id, display_name
+
+
+def _sync_get_latest_project_status(channel_id: int | None = None) -> dict[str, Any] | None:
+    with get_db_session() as db:
+        query = db.query(GoalSession)
+        if channel_id is not None:
+            query = query.filter(GoalSession.channel_id == channel_id)
+        latest = query.order_by(GoalSession.id.desc()).first()
+        if not latest:
+            return None
+        activities = (
+            db.query(Activity)
+            .filter(Activity.session_id == latest.id)
+            .order_by(Activity.id.desc())
+            .limit(3)
+            .all()
+        )
+        return {
+            "id": latest.id,
+            "title": latest.title,
+            "status": latest.status,
+            "objective": latest.objective,
+            "project_dir": latest.project_dir,
+            "updated_at": latest.updated_at,
+            "activities": [
+                {"work": a.work, "result": a.result, "datetime": a.datetime}
+                for a in reversed(activities)
+            ],
+        }
 
 
 async def _resolve_channel(channel_id: int) -> discord.abc.Messageable | None:
@@ -52,77 +176,54 @@ async def _resolve_channel(channel_id: int) -> discord.abc.Messageable | None:
 
 
 async def _find_related_session_id(channel: discord.abc.Messageable, objective: str) -> int | None:
-    """
-    現在のチャンネルまたはスレッドから、引き継ぐべき既存のセッションIDを判定する．
-    テキストチャンネルの場合は判断モデル (d1-2B:Q4_K_M) を用いて高速判定する．
-    """
-    with get_db_session() as db:
-        if isinstance(channel, discord.Thread):
-            latest_session = (
-                db.query(GoalSession)
-                .filter(GoalSession.channel_id == channel.id)
-                .order_by(GoalSession.id.desc())
-                .first()
-            )
-            return latest_session.id if latest_session else None
+    recent_sessions = await asyncio.to_thread(_sync_get_recent_channel_sessions, channel.id, 5)
+    if not recent_sessions:
+        return None
 
-        recent_sessions = (
-            db.query(GoalSession)
-            .filter(GoalSession.channel_id == channel.id)
-            .order_by(GoalSession.id.desc())
-            .limit(5)
-            .all()
-        )
-        if not recent_sessions:
-            return None
+    if isinstance(channel, discord.Thread):
+        return recent_sessions[0]["id"]
 
-        choices: dict[str, str] = {}
-        id_map: dict[str, int] = {}
-        for s in recent_sessions:
-            key = f"SESSION_{s.id}"
-            choices[key] = f"Continue or modify existing project (ID {s.id}): {s.objective[:120]}"
-            id_map[key] = s.id
-        choices["NEW_PROJECT"] = "Start a completely unrelated, brand-new project."
+    choices: dict[str, str] = {}
+    id_map: dict[str, int] = {}
+    for s in recent_sessions:
+        key = f"SESSION_{s['id']}"
+        choices[key] = f"Continue or modify existing project (ID {s['id']}): {s['objective'][:120]}"
+        id_map[key] = s["id"]
+    choices["NEW_PROJECT"] = "Start a completely unrelated, brand-new project."
 
-        chosen_key = await decide_with_d1(
-            state_text=f"New User Request: {objective}",
-            question="Does this request continue/modify one of the existing sessions, or is it a brand-new unrelated project?",
-            choices=choices,
-            default_choice=f"SESSION_{recent_sessions[0].id}",
-        )
-        return id_map.get(chosen_key)
+    chosen_key = await decide_with_d1(
+        state_text=f"New User Request: {objective}",
+        question="Does this request continue/modify one of the existing sessions, or is it a brand-new unrelated project?",
+        choices=choices,
+        default_choice=f"SESSION_{recent_sessions[0]['id']}",
+    )
+    return id_map.get(chosen_key)
 
 
 @bot.event
 async def on_ready() -> None:
-    init_db()
+    await asyncio.to_thread(init_db)
     agent_task_queue.start_workers()
     print(f"Logged in as {bot.user.name} ({bot.user.id}) | Ollama URL: {get_ollama_base_url()}")
 
-    with get_db_session() as db:
-        unfinished_sessions = (
-            db.query(GoalSession)
-            .filter(GoalSession.status.in_(["pending", "running"]))
-            .all()
-        )
-        for sess in unfinished_sessions:
-            if not sess.channel_id:
-                continue
-            channel = await _resolve_channel(sess.channel_id)
-            if not channel:
-                continue
+    unfinished_sessions = await asyncio.to_thread(_sync_get_unfinished_sessions)
+    for sess in unfinished_sessions:
+        if not sess["channel_id"]:
+            continue
+        channel = await _resolve_channel(sess["channel_id"])
+        if not channel:
+            continue
 
-            await channel.send(
-                f"**[システム再起動]** セッション #{sess.id} をタスクキューへ再投入します．"
-            )
-            await enqueue_agent_with_dashboard(
-                channel, sess.id, sess.objective, reply_msg_id=sess.message_id
-            )
+        await channel.send(
+            f"**[システム再起動]** セッション #{sess['id']} をタスクキューへ再投入します．"
+        )
+        await enqueue_agent_with_dashboard(
+            channel, sess["id"], sess["objective"], reply_msg_id=sess["message_id"]
+        )
 
 
 @bot.command(name="models")
 async def list_models_cmd(ctx: commands.Context) -> None:
-    """現在割り当てられているロール別モデルと、Ollamaサーバー上の利用可能モデル一覧を表示する．"""
     async with ctx.typing():
         role_models = get_all_role_models()
         locked = get_locked_model()
@@ -154,7 +255,6 @@ async def list_models_cmd(ctx: commands.Context) -> None:
 
 @bot.command(name="set_model")
 async def set_model_cmd(ctx: commands.Context, role: str, model_name: str = "") -> None:
-    """ロール別の使用モデル、またはロック/自動モードを切り替える．"""
     msg = set_model_for_role(role, model_name)
     await ctx.reply(msg)
 
@@ -162,81 +262,51 @@ async def set_model_cmd(ctx: commands.Context, role: str, model_name: str = "") 
 @bot.command(name="run")
 async def start_task(ctx: commands.Context, *, objective: str) -> None:
     async with ctx.typing():
-        # ▼ 1. 既存セッションの引き継ぎ判定 (d1-2B:Q4_K_M を使用)
         target_session_id = await _find_related_session_id(ctx.channel, objective)
 
         if target_session_id:
-            with get_db_session() as db:
-                session = db.query(GoalSession).filter(GoalSession.id == target_session_id).first()
-                display_name = Path(session.project_dir).name if session.project_dir else f"session_{target_session_id}"
-
-                if session.status in ["running", "pending"]:
+            info = await asyncio.to_thread(_sync_resume_or_intervene_session, target_session_id)
+            if info:
+                if info["was_active"]:
                     add_session_intervention(target_session_id, f"ユーザーからの追加指示: {objective}")
                     await ctx.reply(
-                        f"関連プロジェクト `{display_name}` (Session #{target_session_id}) は現在実行中のため、次ステップへ指示を割り込ませました！"
+                        f"関連プロジェクト `{info['display_name']}` (Session #{target_session_id}) は現在実行中のため、次ステップへ指示を割り込ませました！"
                     )
                 else:
-                    session.status = "pending"
-                    objective_for_run = session.objective
-                    db.commit()
                     add_session_intervention(
                         target_session_id,
                         f"ユーザーからの追加指示: {objective}\nこの指示に従って作業を続行し、完全に動作することを確認してから完了してください。",
                     )
                     await ctx.reply(
-                        f"関連プロジェクト `{display_name}` を検知しました。既存のセッション #{target_session_id} を再開します！"
+                        f"関連プロジェクト `{info['display_name']}` を検知しました。既存のセッション #{target_session_id} を再開します！"
                     )
                     asyncio.create_task(
                         enqueue_agent_with_dashboard(
-                            ctx.channel, target_session_id, objective_for_run, reply_msg_id=ctx.message.id, user_id=ctx.author.id
+                            ctx.channel, target_session_id, info["objective"], reply_msg_id=ctx.message.id, user_id=ctx.author.id
                         )
                     )
-            return
+                return
 
-        # ▼ 2. 新規プロジェクト作成時はちょっとした作業用モデル (LFM3-1.7B:Q4_K_M) でディレクトリ名を生成
         slug_prompt = (
             "次のタスク目標から、プロジェクトを保存するための適切なディレクトリ名を1つだけ出力してください。\n"
             "条件: 英小文字、数字、アンダースコア(_)のみを使用し、空白や他の記号は含めないこと。説明文は一切不要です。\n"
             "※ただし、タスクが「全体を検索する」「既存の全プロジェクトを調べる」といった内容で、特定のプロジェクトに隔離しない方が良い場合は、特殊キーワード 'workspace_root' と出力してください。\n"
-            f"例: shogi_gui, web_server, react_todo_app, workspace_root\n"
+            "例: shogi_gui, web_server, react_todo_app, workspace_root\n"
             f"タスク目標: {objective}"
         )
         slug_result = await ask_llm(slug_prompt, role="light_work")
-        clean_slug = re.sub(r"[^a-z0-9_]", "", slug_result.strip().lower())
-        if not clean_slug:
-            clean_slug = "default_project"
+        clean_slug = re.sub(r"[^a-z0-9_]", "", slug_result.strip().lower()) or "default_project"
 
-        db = SessionLocal()
-        try:
-            session = GoalSession(
-                title=objective[:30],
-                objective=objective,
-                status="pending",
-                channel_id=ctx.channel.id,
-                message_id=ctx.message.id,
-                project_slug=clean_slug,
-                is_forum=isinstance(ctx.channel, discord.Thread),
-            )
-            db.add(session)
-            db.commit()
-            db.refresh(session)
-            session_id = session.id
-
-            if clean_slug in ("workspaceroot", "workspace_root"):
-                proj_dir = get_projects_dir()
-                display_name = "全体のワークスペース"
-            else:
-                proj_dir = get_projects_dir() / clean_slug
-                proj_dir.mkdir(parents=True, exist_ok=True)
-                display_name = clean_slug
-
-            session.project_dir = str(proj_dir)
-            db.commit()
-        finally:
-            db.close()
+        session_id, display_name = await asyncio.to_thread(
+            _sync_create_new_session,
+            objective,
+            ctx.channel.id,
+            ctx.message.id,
+            clean_slug,
+            isinstance(ctx.channel, discord.Thread),
+        )
 
     await ctx.reply(f"プロジェクトディレクトリ `{display_name}` を作成/選択し、セッション #{session_id} を開始します！")
-
     await enqueue_agent_with_dashboard(
         ctx.channel, session_id, objective, reply_msg_id=ctx.message.id, user_id=ctx.author.id
     )
@@ -309,64 +379,43 @@ async def inject_task(ctx: commands.Context, *, message: str) -> None:
 
 @bot.command(name="start_from")
 async def start_from_task(ctx: commands.Context, source_dir_name: str, *, objective: str) -> None:
-    workspace_dir = get_workspace_dir()
-    source_path = workspace_dir / source_dir_name
+    workspace_dir = await asyncio.to_thread(get_workspace_dir)
+    source_path = (workspace_dir / source_dir_name).resolve()
 
-    if not source_path.exists() or not source_path.is_dir():
+    # パストラバーサル防止チェック
+    if workspace_dir not in source_path.parents or not source_path.exists() or not source_path.is_dir():
         await ctx.reply(f"指定されたフォルダ `{source_dir_name}` がワークスペース内に見つかりません。")
         return
 
     slug_prompt = (
         "次のタスク目標から、プロジェクトを保存するための適切なディレクトリ名を1つだけ出力してください。\n"
         "条件: 英小文字、数字、アンダースコア(_)のみを使用し、空白や他の記号は含めないこと。説明文は一切不要です。\n"
-        f"例: shogi_gui, web_server, react_todo_app, workspace_root\n"
+        "例: shogi_gui, web_server, react_todo_app, workspace_root\n"
         f"タスク目標: {objective}"
     )
 
     async with ctx.typing():
         slug_result = await ask_llm(slug_prompt, role="light_work")
-        clean_slug = re.sub(r"[^a-z0-9_]", "", slug_result.strip().lower())
-        if not clean_slug:
-            clean_slug = "default_project"
+        clean_slug = re.sub(r"[^a-z0-9_]", "", slug_result.strip().lower()) or "default_project"
 
-    db = SessionLocal()
-    try:
         enhanced_objective = (
-            f"提供された既存のコード資産をベースに開発を行ってください。\n"
+            "提供された既存のコード資産をベースに開発を行ってください。\n"
             f"まずはファイル一覧や中身を確認して現状を把握し、次の目標を達成してください: {objective}"
         )
 
-        session = GoalSession(
-            title=objective[:30],
-            objective=enhanced_objective,
-            status="pending",
-            channel_id=ctx.channel.id,
-            message_id=ctx.message.id,
-            project_slug=clean_slug,
-            is_forum=isinstance(ctx.channel, discord.Thread),
+        session_id, display_name = await asyncio.to_thread(
+            _sync_create_new_session,
+            enhanced_objective,
+            ctx.channel.id,
+            ctx.message.id,
+            clean_slug,
+            isinstance(ctx.channel, discord.Thread),
+            source_path=source_path,
         )
-        db.add(session)
-        db.commit()
-        db.refresh(session)
-        session_id = session.id
 
-        if clean_slug in ("workspaceroot", "workspace_root"):
-            proj_dir = get_projects_dir()
-            display_name = "全体のワークスペース"
-        else:
-            proj_dir = get_projects_dir() / clean_slug
-            if not proj_dir.exists():
-                shutil.copytree(source_path, proj_dir)
-            else:
-                shutil.copytree(source_path, proj_dir, dirs_exist_ok=True)
-            display_name = clean_slug
-
-        session.project_dir = str(proj_dir)
-        db.commit()
-    finally:
-        db.close()
-
-    await ctx.reply(f"`{source_dir_name}` のコード資産をコピーして、プロジェクトディレクトリ `{display_name}` にてセッション #{session_id} を開始します！")
+    await ctx.reply(
+        f"`{source_dir_name}` のコード資産をコピーして、プロジェクトディレクトリ `{display_name}` にてセッション #{session_id} を開始します！"
+    )
 
     await enqueue_agent_with_dashboard(
         ctx.channel, session_id, enhanced_objective, reply_msg_id=ctx.message.id, user_id=ctx.author.id
@@ -375,44 +424,33 @@ async def start_from_task(ctx: commands.Context, source_dir_name: str, *, object
 
 @bot.command(name="project_status")
 async def project_status(ctx: commands.Context) -> None:
-    with get_db_session() as db:
-        latest = db.query(GoalSession).order_by(GoalSession.id.desc()).first()
-        if not latest:
-            await ctx.reply("登録されているセッション情報はありません．")
-            return
+    status_data = await asyncio.to_thread(_sync_get_latest_project_status)
+    if not status_data:
+        await ctx.reply("登録されているセッション情報はありません．")
+        return
 
-        activities = (
-            db.query(Activity)
-            .filter(Activity.session_id == latest.id)
-            .order_by(Activity.id.desc())
-            .limit(3)
-            .all()
-        )
+    lines = [
+        f"**[Session #{status_data['id']}] {status_data['title']}**",
+        f"• **Status**: `{status_data['status']}`",
+        f"• **Objective**: {status_data['objective']}",
+    ]
+    if status_data["project_dir"]:
+        lines.append(f"• **Workspace**: `{status_data['project_dir']}`")
+    if status_data["updated_at"]:
+        dt = status_data["updated_at"].replace(tzinfo=UTC).astimezone(JST)
+        lines.append(f"• **Updated**: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        lines = [
-            f"**[Session #{latest.id}] {latest.title}**",
-            f"• **Status**: `{latest.status}`",
-            f"• **Objective**: {latest.objective}",
-        ]
-        if latest.project_dir:
-            lines.append(f"• **Workspace**: `{latest.project_dir}`")
-        if latest.updated_at:
-            dt = latest.updated_at.replace(tzinfo=UTC).astimezone(JST)
-            lines.append(f"• **Updated**: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    if status_data["activities"]:
+        lines.append("\n**Recent Activities:**")
+        for act in status_data["activities"]:
+            t_str = (
+                act["datetime"].replace(tzinfo=UTC).astimezone(JST).strftime("%H:%M:%S")
+                if act["datetime"]
+                else "--:--:--"
+            )
+            lines.append(f"- `[{t_str}]` **{act['work']}**: {act['result']}")
 
-        if activities:
-            lines.append("\n**Recent Activities:**")
-            for act in reversed(activities):
-                t_str = (
-                    act.datetime.replace(tzinfo=UTC)
-                    .astimezone(JST)
-                    .strftime("%H:%M:%S")
-                    if act.datetime
-                    else "--:--:--"
-                )
-                lines.append(f"- `[{t_str}]` **{act.work}**: {act.result}")
-
-        await ctx.reply("\n".join(lines))
+    await ctx.reply("\n".join(lines))
 
 
 @bot.event
@@ -420,7 +458,7 @@ async def on_message(message: discord.Message) -> None:
     if message.author == bot.user:
         return
 
-    if pending_human_questions and not message.content.startswith("./"):
+    if pending_human_questions and not message.content.startswith("!"):
         target_id = max(pending_human_questions.keys())
         fut = pending_human_questions[target_id]
         if not fut.done():
@@ -436,7 +474,7 @@ async def on_message(message: discord.Message) -> None:
 
         async with message.channel.typing():
             try:
-                # ▼ 1. チャット履歴の取得（直近10件）
+                # 1. チャット履歴の取得（直近10件）
                 history_text = ""
                 try:
                     hist_msgs = [m async for m in message.channel.history(limit=10, before=message)]
@@ -461,27 +499,26 @@ async def on_message(message: discord.Message) -> None:
 
                 context_str = f"【直近のチャット履歴】\n{history_text}\n\n" if history_text else ""
 
-                # ▼ 2. 判断用モデル (d1-2B:Q4_K_M) でユーザー発言の意図を高速分類
+                # 2. 判断用モデルでユーザー発言の意図を高速分類
                 intent_choices = {
                     "TASK": (
-                        "コードの作成、3Dモデル生成スクリプト作成、ファイルの編集、バグ修正、"
-                        "コマンド実行、シミュレーション作成、「続きをやって」「もう一回実行して」などの作業依頼"
+                        "ファイル作成・編集、コード生成、バグ修正、コマンド実行、「続きをやって」など、"
+                        "実際にワークスペースのファイルを操作したり、エージェントを動かす作業依頼。"
                     ),
-                    "TECH_CHAT": (
-                        "ファイル作成や編集は伴わないが、成果物のプレゼン作成、技術的な解説、"
-                        "アーキテクチャの相談などを行う対話"
+                    "CHAT": (
+                        "現在のプロジェクトの進捗確認、状況の質問、技術的な相談、プレゼン作成、"
+                        "単なる挨拶や雑談など、ワークスペースの変更を伴わない対話。"
                     ),
-                    "LIGHT_CHAT": "単なる挨拶、雑談、非常に簡単な質問",
                 }
                 intent = await decide_with_d1(
                     state_text=f"{context_str}【今回のユーザーの発言】: {clean_prompt}",
-                    question="ユーザーの発言の意図を TASK, TECH_CHAT, LIGHT_CHAT のいずれかに分類してください。",
+                    question="ユーザーの意図が、実際にファイルを操作する作業依頼(TASK)か、それとも進捗確認や対話(CHAT)かを判定してください。進捗確認はCHATになります。",
                     choices=intent_choices,
-                    default_choice="TASK",
+                    default_choice="CHAT",
                 )
 
                 if intent == "TASK":
-                    # ▼ 3. ちょっとした作業用モデル (LFM3-1.7B:Q4_K_M) で相槌と具体的な目標を生成
+                    # 3. ちょっとした作業用モデルで相槌と具体的な目標を生成
                     reply_prompt = (
                         "以下のユーザーの作業依頼を引き受ける際の、頼もしいアシスタントとしての自然な日本語の返事（1〜2文）のみを出力してください。\n"
                         f"【ユーザーの発言】: {clean_prompt}"
@@ -505,102 +542,90 @@ async def on_message(message: discord.Message) -> None:
                     if not refined_objective or refined_objective.startswith("Error"):
                         refined_objective = clean_prompt
 
-                    # ▼ 4. 判断モデル (d1-2B:Q4_K_M) で既存セッションの引き継ぎ判定
                     target_session_id = await _find_related_session_id(message.channel, refined_objective)
 
-                    # ▼ 5. セッションの再開（割り込み）または新規作成
                     if target_session_id:
-                        with get_db_session() as db:
-                            session = db.query(GoalSession).filter(GoalSession.id == target_session_id).first()
-                            display_name = Path(session.project_dir).name if session.project_dir else f"session_{target_session_id}"
-
-                            if session.status in ["running", "pending"]:
+                        info = await asyncio.to_thread(_sync_resume_or_intervene_session, target_session_id)
+                        if info:
+                            if info["was_active"]:
                                 add_session_intervention(target_session_id, f"ユーザーからの追加指示: {refined_objective}")
                                 await message.channel.send(
-                                    f"関連プロジェクト `{display_name}` (Session #{target_session_id}) は現在実行中のため、次ステップへ指示を割り込ませました！"
+                                    f"関連プロジェクト `{info['display_name']}` (Session #{target_session_id}) は現在実行中のため、次ステップへ指示を割り込ませました！"
                                 )
                             else:
-                                session.status = "pending"
-                                objective_for_run = session.objective
-                                db.commit()
                                 add_session_intervention(
                                     target_session_id,
                                     f"ユーザーからの追加指示: {refined_objective}\nこの指示に従って作業を続行し、完全に動作することを確認してから完了してください。",
                                 )
                                 await message.channel.send(
-                                    f"関連プロジェクト `{display_name}` を検知しました。既存のセッション #{target_session_id} を再開します！"
+                                    f"関連プロジェクト `{info['display_name']}` を検知しました。既存のセッション #{target_session_id} を再開します！"
                                 )
                                 asyncio.create_task(
                                     enqueue_agent_with_dashboard(
                                         message.channel,
                                         target_session_id,
-                                        objective_for_run,
+                                        info["objective"],
                                         reply_msg_id=message.id,
                                         user_id=message.author.id,
                                     )
                                 )
-                    else:
-                        slug_prompt = (
-                            "次のタスク目標から、プロジェクトを保存するための適切なディレクトリ名を1つだけ出力してください。\n"
-                            "条件: 英小文字、数字、アンダースコア(_)のみを使用し、空白や他の記号は含めないこと。説明文は一切不要です。\n"
-                            "※重要: もしタスクが「全体を検索する」「既存のプロジェクトを調べる」など特定のプロジェクトへの隔離が不適切な内容であれば 'workspace_root' と出力してください。\n"
-                            f"例: shogi_gui, web_server, drone_3d_model, workspace_root\n"
-                            f"タスク目標: {refined_objective}"
-                        )
-                        slug_result = await ask_llm(slug_prompt, role="light_work")
-                        clean_slug = re.sub(r"[^a-z0-9_]", "", slug_result.strip().lower())
-                        if not clean_slug:
-                            clean_slug = "default_project"
+                            return
 
-                        db = SessionLocal()
-                        try:
-                            session = GoalSession(
-                                title=refined_objective[:30],
-                                objective=refined_objective,
-                                status="pending",
-                                channel_id=message.channel.id,
-                                message_id=message.id,
-                                project_slug=clean_slug,
-                                is_forum=isinstance(message.channel, discord.Thread),
-                            )
-                            db.add(session)
-                            db.commit()
-                            db.refresh(session)
-                            session_id = session.id
+                    slug_prompt = (
+                        "次のタスク目標から、プロジェクトを保存するための適切なディレクトリ名を1つだけ出力してください。\n"
+                        "条件: 英小文字、数字、アンダースコア(_)のみを使用し、空白や他の記号は含めないこと。説明文は一切不要です。\n"
+                        "※重要: もしタスクが「全体を検索する」「既存のプロジェクトを調べる」など特定のプロジェクトへの隔離が不適切な内容であれば 'workspace_root' と出力してください。\n"
+                        "例: shogi_gui, web_server, drone_3d_model, workspace_root\n"
+                        f"タスク目標: {refined_objective}"
+                    )
+                    slug_result = await ask_llm(slug_prompt, role="light_work")
+                    clean_slug = re.sub(r"[^a-z0-9_]", "", slug_result.strip().lower()) or "default_project"
 
-                            if clean_slug in ("workspaceroot", "workspace_root"):
-                                proj_dir = get_workspace_dir()
-                                display_name = "全体のワークスペース"
-                            else:
-                                proj_dir = get_projects_dir() / clean_slug
-                                proj_dir.mkdir(parents=True, exist_ok=True)
-                                display_name = clean_slug
+                    session_id, display_name = await asyncio.to_thread(
+                        _sync_create_new_session,
+                        refined_objective,
+                        message.channel.id,
+                        message.id,
+                        clean_slug,
+                        isinstance(message.channel, discord.Thread),
+                        use_workspace_root_on_special=True,
+                    )
 
-                            session.project_dir = str(proj_dir)
-                            db.commit()
-                        finally:
-                            db.close()
-
-                        await message.channel.send(
-                            f"新規プロジェクト `{display_name}` を作成/選択し、セッション #{session_id} を開始します！"
-                        )
-                        await enqueue_agent_with_dashboard(
-                            message.channel,
-                            session_id,
-                            refined_objective,
-                            reply_msg_id=message.id,
-                            user_id=message.author.id,
-                        )
+                    await message.channel.send(
+                        f"新規プロジェクト `{display_name}` を作成/選択し、セッション #{session_id} を開始します！"
+                    )
+                    await enqueue_agent_with_dashboard(
+                        message.channel,
+                        session_id,
+                        refined_objective,
+                        reply_msg_id=message.id,
+                        user_id=message.author.id,
+                    )
 
                 else:
-                    # ▼ CHAT（プレゼン・質問・雑談）の場合は内容に応じてモデルを自動選択
-                    chat_role = "omni" if intent == "TECH_CHAT" else "light_work"
+                    # 4. CHAT（進捗確認・質問・雑談）の場合は最新ステータスを踏まえてモデルが返答
+                    status_data = await asyncio.to_thread(_sync_get_latest_project_status, message.channel.id)
+                    project_info = ""
+                    if status_data:
+                        act_str = "\n".join(
+                            [f"- {a['work']}: {a['result']}" for a in status_data["activities"]]
+                        )
+                        project_info = (
+                            "【現在のプロジェクト状況 (参考情報)】\n"
+                            f"セッションID: {status_data['id']}\n"
+                            f"目標: {status_data['objective']}\n"
+                            f"ステータス: {status_data['status']}\n"
+                            f"最近のアクティビティ:\n{act_str}\n\n"
+                        )
+
                     chat_prompt = (
-                        "あなたは優秀なプログラミングアシスタントです。以下のチャット履歴を踏まえて、ユーザーの発言に自然な日本語で返答してください。\n\n"
+                        "あなたは優秀なプログラミングアシスタントです。以下のチャット履歴と現在のプロジェクト状況を踏まえて、ユーザーの発言に自然な日本語で返答してください。\n"
+                        "※もし進捗や現状を聞かれた場合は、参考情報の「最近のアクティビティ」などを要約して分かりやすく答えてください。\n\n"
+                        f"{project_info}"
                         f"{context_str}"
                         f"【ユーザーの発言】: {clean_prompt}"
                     )
-                    response_text = await ask_llm(chat_prompt, role=chat_role)
+                    response_text = await ask_llm(chat_prompt, role="omni")
                     if not response_text or not response_text.strip():
                         response_text = "申し訳ありません、応答を生成できませんでした。もう一度お試しください。"
                     await send_chunked_message(

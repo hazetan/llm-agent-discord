@@ -1,6 +1,6 @@
 import os
+import shlex
 import subprocess
-import threading
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -35,11 +35,11 @@ IGNORE_PATTERNS: set[str] = {
 EXCLUDED_EXTENSIONS: tuple[str, ...] = (".pyc", ".tmp", ".log")
 
 
-# --- ワークスペース & パス検証 ---
 def is_safe_path(target_path: Path, base_dir: Path) -> bool:
     try:
         resolved = target_path.resolve()
-        return base_dir in resolved.parents or resolved == base_dir
+        base_resolved = base_dir.resolve()
+        return base_resolved in resolved.parents or resolved == base_resolved
     except Exception:
         return False
 
@@ -98,9 +98,8 @@ def package_project_to_zip(project_dir: Path, session_id: int) -> Path:
     return zip_path
 
 
-# --- Docker サンドボックス抽象化クラス (スケールアウト対応) ---
 class DockerSandboxManager:
-    """Docker SDK を用いてローカルおよびリモート Docker ノードのコンテナを統合管理する．"""
+    """Docker SDK / CLI を用いてコンテナを管理し、プロセス単位のタイムアウト制御を行う．"""
 
     def __init__(self) -> None:
         self._session_host_map: dict[int, str] = {}
@@ -110,7 +109,6 @@ class DockerSandboxManager:
         return f"runner_session_{session_id or 'default'}"
 
     def _get_sdk_client(self, session_id: int | None) -> Any:
-        """最も負荷の低い Docker ホストを選択して DockerClient を返す．"""
         if not HAS_DOCKER_SDK:
             return None
 
@@ -142,7 +140,6 @@ class DockerSandboxManager:
         return best_client
 
     def ensure_container(self, session_id: int | None, project_dir: Path) -> str:
-        """サンドボックスコンテナの稼働を確認し，未起動ならリソース制限付きで起動する．"""
         container_name = self.get_container_name(session_id)
         client = self._get_sdk_client(session_id)
 
@@ -168,20 +165,20 @@ class DockerSandboxManager:
                     str(project_dir.resolve()): {"bind": "/workspace", "mode": "rw"}
                 },
             )
-            
-            # ▼ 追加: 必須ユーティリティの自動インストール
+
             try:
-                setup_cmd = "apt-get update && apt-get install -y git curl procps sqlite3"
+                setup_cmd = (
+                    "which git >/dev/null 2>&1 || "
+                    "(apt-get update && apt-get install -y git curl procps sqlite3 coreutils)"
+                )
                 container.exec_run(cmd=["sh", "-c", setup_cmd], user="root")
             except Exception:
                 pass
-                
+
             return container_name
 
-        # CLI フォールバック
         return self._ensure_container_cli(container_name, project_dir)
 
-    # CLI フォールバック側も同様に修正
     def _ensure_container_cli(self, container_name: str, project_dir: Path) -> str:
         check = subprocess.run(
             ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
@@ -205,67 +202,86 @@ class DockerSandboxManager:
         res = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if res.returncode != 0:
             raise RuntimeError(f"Docker container start failed: {res.stderr}")
-            
-        # ▼ 追加: CLI環境での必須ユーティリティ自動インストール
+
         subprocess.run(
-            ["docker", "exec", "-u", "root", container_name, "sh", "-c", "apt-get update && apt-get install -y git curl procps sqlite3"],
-            check=False, capture_output=True
+            [
+                "docker", "exec", "-u", "root", container_name, "sh", "-c",
+                "which git >/dev/null 2>&1 || (apt-get update && apt-get install -y git curl procps sqlite3 coreutils)",
+            ],
+            check=False,
+            capture_output=True,
         )
-            
         return container_name
 
     def execute_command(
         self, session_id: int | None, workspace_dir: Path, command: str
     ) -> str:
-        """コンテナ内でタイムアウト監視付きでコマンドを実行する．"""
+        """
+        コンテナ内の `timeout` ユーティリティを使ってプロセスツリー単位で制限時間を設ける。
+        タイムアウト時もコンテナ自体は再起動せず、対象プロセスのみを終了させる。
+        """
         timeout_sec = get_command_timeout()
         container_name = self.ensure_container(session_id, workspace_dir)
         client = self._get_sdk_client(session_id)
 
+        # timeout コマンドでラップ (終了コード 124 または 137 がタイムアウト)
+        wrapped_cmd = f"timeout -k 5 {timeout_sec}s sh -c {shlex.quote(command)}"
+
         if client is not None:
             try:
                 container = client.containers.get(container_name)
-                result_holder: dict[str, Any] = {}
+                exit_code, output_bytes = container.exec_run(
+                    cmd=["sh", "-c", wrapped_cmd],
+                    workdir="/workspace",
+                    demux=False,
+                )
+                output = (
+                    output_bytes.decode("utf-8", errors="replace").strip()
+                    if output_bytes
+                    else ""
+                )
 
-                def _run_exec() -> None:
-                    try:
-                        exit_code, output_bytes = container.exec_run(
-                            cmd=["sh", "-c", command],
-                            workdir="/workspace",
-                            demux=False,
-                        )
-                        result_holder["output"] = (
-                            output_bytes.decode("utf-8", errors="replace").strip()
-                            if output_bytes
-                            else ""
-                        )
-                    except Exception as exc:
-                        result_holder["error"] = str(exc)
-
-                exec_thread = threading.Thread(target=_run_exec, daemon=True)
-                exec_thread.start()
-                exec_thread.join(timeout=timeout_sec)
-
-                if exec_thread.is_alive():
-                    container.restart(timeout=2)
+                if exit_code in (124, 137):
                     return (
-                        f"Error: Command timed out ({timeout_sec}s limit). "
-                        "Container restarted to clear hanging processes."
+                        f"Error: Command timed out after {timeout_sec}s and was terminated.\n"
+                        f"Partial output before timeout:\n{output}"
                     )
 
-                if "error" in result_holder:
-                    return f"Execution error in sandbox: {result_holder['error']}"
-
-                output = result_holder.get("output", "")
                 git_commit_checkpoint(workspace_dir, f"run_command: {command[:50]}")
-                return output or "(execution completed with no output)"
+                if exit_code != 0 and output:
+                    return f"[Exit Code: {exit_code}]\n{output}"
+                return output or f"(execution completed with exit code {exit_code})"
             except Exception as exc:
                 return f"Execution error in Docker SDK sandbox: {exc}"
 
-        return self._execute_command_cli(container_name, workspace_dir, command, timeout_sec)
+        return self._execute_command_cli(container_name, workspace_dir, command, wrapped_cmd, timeout_sec)
+
+    def _execute_command_cli(
+        self, container_name: str, workspace_dir: Path, raw_cmd: str, wrapped_cmd: str, timeout_sec: int
+    ) -> str:
+        docker_exec_cmd = [
+            "docker", "exec", "-w", "/workspace", container_name, "sh", "-c", wrapped_cmd
+        ]
+        try:
+            res = subprocess.run(
+                docker_exec_cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec + 10,
+            )
+            output = (res.stdout + res.stderr).strip()
+            if res.returncode in (124, 137):
+                return f"Error: Command timed out ({timeout_sec}s limit).\n{output}"
+
+            git_commit_checkpoint(workspace_dir, f"run_command: {raw_cmd[:50]}")
+            return output or f"(execution completed with exit code {res.returncode})"
+        except subprocess.TimeoutExpired:
+            return f"Error: Command timed out ({timeout_sec}s limit)."
+        except Exception as exc:
+            return f"Execution error in sandbox: {exc}"
 
     def stop_container(self, session_id: int | None) -> None:
-        """セッション終了時にコンテナを破棄し，ホスト割り当て情報を解放する．"""
         container_name = self.get_container_name(session_id)
         client = self._get_sdk_client(session_id)
 
@@ -287,30 +303,6 @@ class DockerSandboxManager:
         )
 
 
-    def _execute_command_cli(
-        self, container_name: str, workspace_dir: Path, command: str, timeout_sec: int
-    ) -> str:
-        docker_exec_cmd = [
-            "docker", "exec", "-w", "/workspace", container_name, "sh", "-c", command
-        ]
-        try:
-            proc = subprocess.Popen(
-                docker_exec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            try:
-                stdout, stderr = proc.communicate(timeout=timeout_sec)
-                output = (stdout + stderr).strip()
-                git_commit_checkpoint(workspace_dir, f"run_command: {command[:50]}")
-                return output or "(execution completed with no output)"
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                self._ensure_container_cli(container_name, workspace_dir)
-                return f"Error: Command timed out ({timeout_sec}s limit). Process killed."
-        except Exception as exc:
-            return f"Execution error in sandbox: {exc}"
-
-
-# シングルトンマネージャと互換ラッパー関数
 sandbox_manager = DockerSandboxManager()
 
 
@@ -322,7 +314,6 @@ def stop_docker_container(session_id: int | None) -> None:
     sandbox_manager.stop_container(session_id)
 
 
-# --- Git チェックポイント管理 ---
 def _run_git(project_dir: Path, *git_args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *git_args],
