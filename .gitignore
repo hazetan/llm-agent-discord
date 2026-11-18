@@ -1,9 +1,7 @@
 # Custom
 log/
 .venv
-.database/
-llm_models
-llama_cpp
+.database
 workspace
 
 # Byte-compiled / optimized / DLL files
