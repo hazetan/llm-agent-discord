@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import json
 import re
 import time
@@ -8,6 +9,7 @@ import aiohttp
 
 from .config import (
     get_llm_timeout,
+    get_max_concurrent_llm,
     get_model_for_role,
     get_ollama_chat_url,
     get_ollama_keep_alive,
@@ -22,6 +24,16 @@ HIGH_THINKING_DIRECTIVE = (
     "ツールを呼び出す前に、必ず現在の状況・ディレクトリ構造・問題の本質・影響範囲・エッジケースを"
     "最高レベルの深さで段階的に思考（Thinking）し、論理的な整合性を検証してから行動してください。"
 )
+
+
+_llm_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_llm_semaphore() -> asyncio.Semaphore:
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        _llm_semaphore = asyncio.Semaphore(get_max_concurrent_llm())
+    return _llm_semaphore
 
 
 def extract_thinking_and_clean(raw_content: str, explicit_thinking: str = "") -> tuple[str, str]:
@@ -172,44 +184,45 @@ async def chat_step(
     start_t = time.perf_counter()
     timeout = aiohttp.ClientTimeout(total=get_llm_timeout())
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(get_ollama_chat_url(), json=payload) as resp:
-            data = await resp.json()
+    async with _get_llm_semaphore():
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(get_ollama_chat_url(), json=payload) as resp:
+                data = await resp.json()
 
-            # もしモデルが "high"/"max" 等の文字列レベル指定に非対応で 400 を返した場合、think=True で自動再試行
-            if resp.status == 400 and isinstance(think_setting, str):
-                payload["think"] = True
-                async with session.post(get_ollama_chat_url(), json=payload) as retry_resp:
-                    resp = retry_resp
-                    data = await retry_resp.json()
+                # もしモデルが "high"/"max" 等の文字列レベル指定に非対応で 400 を返した場合、think=True で自動再試行
+                if resp.status == 400 and isinstance(think_setting, str):
+                    payload["think"] = True
+                    async with session.post(get_ollama_chat_url(), json=payload) as retry_resp:
+                        resp = retry_resp
+                        data = await retry_resp.json()
 
-            if resp.status != 200 or "message" not in data:
-                raise RuntimeError(f"Ollama Error ({resp.status}, model={model_name}): {data}")
+                if resp.status != 200 or "message" not in data:
+                    raise RuntimeError(f"Ollama Error ({resp.status}, model={model_name}): {data}")
 
-            # 2. 推論完了後に Ollama からの正確な実測トークン数で上書き更新
-            prompt_tok = int(data.get("prompt_eval_count") or 0)
-            eval_tok = int(data.get("eval_count") or 0)
-            api_total_tok = prompt_tok + eval_tok
-            telemetry.update_role_tokens(role, max(api_total_tok, est_input_tok))
+                # 2. 推論完了後に Ollama からの正確な実測トークン数で上書き更新
+                prompt_tok = int(data.get("prompt_eval_count") or 0)
+                eval_tok = int(data.get("eval_count") or 0)
+                api_total_tok = prompt_tok + eval_tok
+                telemetry.update_role_tokens(role, max(api_total_tok, est_input_tok))
 
-            msg = data["message"]
-            raw_content = msg.get("content") or ""
-            explicit_thinking = msg.get("thinking") or msg.get("reasoning") or ""
+                msg = data["message"]
+                raw_content = msg.get("content") or ""
+                explicit_thinking = msg.get("thinking") or msg.get("reasoning") or ""
 
-            thinking_text, clean_content = extract_thinking_and_clean(raw_content, explicit_thinking)
+                thinking_text, clean_content = extract_thinking_and_clean(raw_content, explicit_thinking)
 
-            if not msg.get("tool_calls") and clean_content:
-                fb_calls = extract_fallback_tool_calls(clean_content)
-                if fb_calls:
-                    msg["tool_calls"] = fb_calls
+                if not msg.get("tool_calls") and clean_content:
+                    fb_calls = extract_fallback_tool_calls(clean_content)
+                    if fb_calls:
+                        msg["tool_calls"] = fb_calls
 
-            msg["_clean_content"] = clean_content
-            if thinking_text and clean_content:
-                msg["content"] = f"[Thinking]\n{thinking_text}\n\n[Response]\n{clean_content}"
-            elif thinking_text:
-                msg["content"] = thinking_text
-            else:
-                msg["content"] = clean_content
+                msg["_clean_content"] = clean_content
+                if thinking_text and clean_content:
+                    msg["content"] = f"[Thinking]\n{thinking_text}\n\n[Response]\n{clean_content}"
+                elif thinking_text:
+                    msg["content"] = thinking_text
+                else:
+                    msg["content"] = clean_content
 
     latency = time.perf_counter() - start_t
     return msg, latency, model_name

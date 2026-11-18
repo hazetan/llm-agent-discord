@@ -259,8 +259,21 @@ def get_samba_enable() -> bool:
 def get_samba_port() -> int:
     return get_env_int("SAMBA_PORT", 445) or 445
 
+
 def get_desktop_metrics_url() -> str | None:
     return get_env_str("DESKTOP_METRICS_URL")
 
+
 def get_sandbox_env_hint() -> str | None:
     return get_env_str("SANDBOX_ENV_HINT")
+
+
+# --- Parallel Workers & Concurrency ---
+def get_max_concurrent_llm() -> int:
+    return max(1, get_env_int("MAX_CONCURRENT_LLM", 1) or 1)
+
+
+def get_worker_count(role: str) -> int:
+    key = f"WORKER_{role.upper()}_COUNT"
+    default_cnt = 2 if role.upper() == "PG" else 1
+    return max(1, get_env_int(key, default_cnt) or default_cnt)

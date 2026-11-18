@@ -1,3 +1,4 @@
+import contextvars
 import os
 import shlex
 import subprocess
@@ -13,9 +14,16 @@ from core.config import (
     get_workspace_dir,
 )
 
-CONTAINER_NAME = "sier_agent_sandbox"
+CONTAINER_BASE_NAME = "sier_agent_sandbox"
 CONTAINER_HOME = "/root"
 IGNORE_DIRS = {".git", "__pycache__", ".venv", "venv", ".pytest_cache", "node_modules"}
+
+current_worker_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("current_worker", default="main")
+
+
+def get_active_container_name() -> str:
+    worker_id = current_worker_ctx.get().lower().replace("-", "_")
+    return f"{CONTAINER_BASE_NAME}_{worker_id}"
 
 
 def resolve_workspace_path(raw_path: str) -> Path | None:
@@ -54,25 +62,27 @@ def resolve_workspace_path(raw_path: str) -> Path | None:
     return None
 
 
-def ensure_sandbox_container(recreate: bool = False) -> None:
-    """workspace_dir をコンテナ内の /root (~/) にマウントして起動する"""
+# --- ensure_sandbox_container と run_in_sandbox を以下で置換 ---
+def ensure_sandbox_container(recreate: bool = False, container_name: str | None = None) -> str:
+    """ワーカーごとの独立コンテナに workspace_dir を /root (~/) としてマウントし起動する"""
+    c_name = container_name or get_active_container_name()
     workspace_dir = get_workspace_dir().resolve()
     if recreate:
-        subprocess.run(["docker", "rm", "-f", CONTAINER_NAME], check=False, capture_output=True)
+        subprocess.run(["docker", "rm", "-f", c_name], check=False, capture_output=True)
 
     check = subprocess.run(
-        ["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER_NAME],
+        ["docker", "inspect", "-f", "{{.State.Running}}", c_name],
         check=False,
         capture_output=True,
         text=True,
     )
     if check.returncode == 0 and "true" in check.stdout.lower():
-        return
+        return c_name
 
-    subprocess.run(["docker", "rm", "-f", CONTAINER_NAME], check=False, capture_output=True)
+    subprocess.run(["docker", "rm", "-f", c_name], check=False, capture_output=True)
     cmd = [
         "docker", "run", "-d",
-        "--name", CONTAINER_NAME,
+        "--name", c_name,
         "-e", f"HOME={CONTAINER_HOME}",
         "-v", f"{workspace_dir}:{CONTAINER_HOME}",
         "-w", CONTAINER_HOME,
@@ -84,23 +94,23 @@ def ensure_sandbox_container(recreate: bool = False) -> None:
     cmd.extend([get_docker_image(), "tail", "-f", "/dev/null"])
     res = subprocess.run(cmd, check=False, capture_output=True, text=True)
     if res.returncode != 0:
-        raise RuntimeError(f"Failed to start Docker container: {res.stderr}")
+        raise RuntimeError(f"Failed to start Docker container ({c_name}): {res.stderr}")
+    return c_name
 
 
 def run_in_sandbox(command: str) -> str:
-    """コンテナ内の /root (~/) でコマンドを実行し、生成ファイルの所有権をホストユーザーに揃える"""
-    ensure_sandbox_container(recreate=False)
+    """現在のワーカー専用コンテナ内の /root (~/) でコマンドを実行する"""
+    c_name = ensure_sandbox_container(recreate=False)
     timeout_sec = get_command_timeout()
     uid = os.getuid()
     gid = os.getgid()
 
-    # コマンド実行後、終了コードを維持したまま /root 配下の所有権をホストの UID:GID に戻す
     inner_script = f"{command}; EXIT_CODE=$?; chown -R {uid}:{gid} {CONTAINER_HOME} 2>/dev/null; exit $EXIT_CODE"
     wrapped = f"timeout -k 5 {timeout_sec}s sh -c {shlex.quote(inner_script)}"
 
     try:
         res = subprocess.run(
-            ["docker", "exec", "-w", CONTAINER_HOME, CONTAINER_NAME, "sh", "-c", wrapped],
+            ["docker", "exec", "-w", CONTAINER_HOME, c_name, "sh", "-c", wrapped],
             check=False,
             capture_output=True,
             text=True,

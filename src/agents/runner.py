@@ -4,6 +4,7 @@ from core.config import get_max_steps_per_phase, get_sandbox_env_hint
 from core.llm_client import chat_step
 from core.logger import RoleLogger
 from core.telemetry import telemetry
+from sandbox.container import current_worker_ctx
 from sandbox.tools import execute_tool, parse_tool_args, read_workspace_doc
 
 from .roles import ROLE_ALLOWED_TOOLS, ROLE_PROMPTS, get_tools_for_role
@@ -26,11 +27,19 @@ def build_fresh_workspace_snapshot() -> str:
     )
 
 
-async def run_role_phase(role: str, instruction: str, max_steps: int | None = None) -> tuple[str, list[str]]:
+async def run_role_phase(
+    role: str,
+    instruction: str,
+    max_steps: int | None = None,
+    worker_id: str | None = None,
+) -> tuple[str, list[str]]:
     role = role.upper()
-    telemetry.set_active_role(role)
+    w_id = (worker_id or role).upper()
+    token = current_worker_ctx.set(w_id)
+    telemetry.set_worker_active(w_id, role, True)
+
     steps_limit = max_steps or get_max_steps_per_phase()
-    logger = RoleLogger(role)
+    logger = RoleLogger(w_id)
     tools = get_tools_for_role(ROLE_ALLOWED_TOOLS[role])
 
     system_prompt = ROLE_PROMPTS[role]
@@ -84,11 +93,10 @@ async def run_role_phase(role: str, instruction: str, max_steps: int | None = No
 
                 output = await execute_tool(fn_name, parsed_args)
                 logger.log_step(step, thought, fn_name, parsed_args, output, latency)
-                telemetry.add_branch_event(role, fn_name, parsed_args, output)
+                telemetry.add_branch_event(w_id, fn_name, parsed_args, output)
 
-                # 生ログBoxのデータを更新し、リアルタイム描画をトリガー
                 telemetry.record_raw_step(
-                    role, model_name, step, steps_limit, latency, thought, fn_name, parsed_args, output
+                    w_id, model_name, step, steps_limit, latency, thought, fn_name, parsed_args, output
                 )
                 if telemetry.on_raw_update:
                     await telemetry.on_raw_update()
@@ -113,4 +121,5 @@ async def run_role_phase(role: str, instruction: str, max_steps: int | None = No
 
         return final_summary, created_zips
     finally:
-        telemetry.set_active_role("IDLE")
+        telemetry.set_worker_active(w_id, role, False)
+        current_worker_ctx.reset(token)

@@ -41,11 +41,10 @@ class BranchEvent:
 
 @dataclass
 class SystemTelemetry:
-    active_role: str = "IDLE"
+    active_workers: dict[str, str] = field(default_factory=dict)  # {worker_id: role}
     role_ctx_tokens: dict[str, int] = field(default_factory=lambda: {r: 0 for r in ROLES})
     branches: deque[BranchEvent] = field(default_factory=lambda: deque(maxlen=4))
 
-    # log-raw 用の最新ステップ生データ
     raw_role: str = "IDLE"
     raw_model: str = "-"
     raw_step: int = 0
@@ -55,12 +54,25 @@ class SystemTelemetry:
     raw_tool_name: str = "-"
     raw_tool_args: str = "-"
     raw_tool_output: str = "(まだ出力はありません)"
-    on_raw_update: Any = None  # 非同期コールバック関数
+    on_raw_update: Any = None
+
+    @property
+    def active_role(self) -> str:
+        if not self.active_workers:
+            return "IDLE"
+        return ",".join(sorted(self.active_workers.keys()))[:18]
+
+    def set_worker_active(self, worker_id: str, role: str, is_active: bool) -> None:
+        if is_active:
+            self.active_workers[worker_id] = role.upper()
+        else:
+            self.active_workers.pop(worker_id, None)
 
     def set_active_role(self, role: str) -> None:
-        if role != self.active_role:
-            self.branches.clear()
-        self.active_role = role
+        if role == "IDLE":
+            self.active_workers.clear()
+        else:
+            self.active_workers[role] = role.upper()
 
     def update_role_tokens(self, role: str, used_tokens: int) -> None:
         if used_tokens > 0:
@@ -265,7 +277,7 @@ async def render_status_box() -> str:
         ctx_tok = telemetry.role_ctx_tokens.get(role, 0)
         ctx_ratio = ctx_tok / max_ctx if max_ctx else 0.0
 
-        is_active = telemetry.active_role == role
+        is_active = role in telemetry.active_workers.values()
         mark = "▶" if is_active else "•"
         color = C_CYAN if is_active else C_WHITE
         short_model = model[:14].ljust(14)

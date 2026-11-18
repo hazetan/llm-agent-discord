@@ -187,6 +187,9 @@ def parse_tool_args(raw_args: Any) -> dict[str, Any]:
     return {}
 
 
+_file_write_lock = asyncio.Lock()
+
+
 async def execute_tool(name: str, raw_args: Any) -> str:
     args = parse_tool_args(raw_args)
     if name == "complete_phase":
@@ -194,4 +197,9 @@ async def execute_tool(name: str, raw_args: Any) -> str:
     fn = TOOL_DISPATCH.get(name)
     if not fn:
         return f"Error: Unknown tool '{name}'."
+
+    if name in ("write_file", "replace_in_file"):
+        async with _file_write_lock:
+            return await asyncio.to_thread(fn, args)
+
     return await asyncio.to_thread(fn, args)
