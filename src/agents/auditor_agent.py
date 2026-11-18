@@ -1,7 +1,7 @@
 import asyncio
 
-from src.core.config import get_auditor_interval_sec
-from src.core.logger import read_recent_logs
+from core.config import get_auditor_interval_sec
+from core.logger import read_recent_logs
 
 from .runner import run_role_phase
 

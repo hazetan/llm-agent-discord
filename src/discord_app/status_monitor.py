@@ -3,12 +3,12 @@ import time
 
 import discord
 
-from src.core.config import (
+from core.config import (
     get_raw_log_channel_id,
     get_status_channel_id,
     get_status_update_interval_sec,
 )
-from src.core.telemetry import render_raw_log_box, render_status_box, telemetry
+from core.telemetry import render_raw_log_box, render_status_box, telemetry
 
 RAW_LOG_MIN_INTERVAL_SEC = 2.5  # Discord APIレート制限回避用の最小更新間隔
 

@@ -141,6 +141,7 @@ ROLE_PROMPTS: dict[str, str] = {
         "1. `~/TASK.md` 内の `[TODO]` タスクを確認し、`list_files` や `read_file` で現在の `~/` 内のディレクトリ構造・既存コードを徹底調査してください。\n"
         "2. どのディレクトリ（例: `~/a/`）のどのファイルを作成・改修するか、具体的なファイルパス・モジュール設計・検証手順を `~/DESIGN.md` に記述してください。\n"
         "3. 設計が完了したら、`~/TASK.md` の該当タスクのタグを `[TODO]` から `[IMPL]` に書き換え、`complete_phase` を呼び出してください。"
+        "※ Docker環境には Python3, gcc/g++, micropython コマンドが導入済みです。MicroPython開発時はハードウェア依存部(machine等)を分離・モック化し、`micropython` コマンドで動作確認してください。\n"
     ),
     "PG": (
         "あなたは日本の大手1次請けSIerの【PG（プログラマー / 実装担当）】です。\n"
@@ -149,6 +150,7 @@ ROLE_PROMPTS: dict[str, str] = {
         "1. `~/TASK.md` の `[IMPL]` または `[FIX]`（差戻し）タスクと、`~/DESIGN.md` の設計書を確認してください。\n"
         "2. 設計書で指定された `~/` 配下のパスにソースコードを実装し、`run_command` で構文エラーや単体動作を確認してください。\n"
         "3. 実装と単体確認が終わったら、`~/TASK.md` の該当タスクのタグを `[QA]`（検証待ち）に更新し、`complete_phase` を呼び出してください。"
+        "※ Docker環境には Python3, gcc/g++, micropython コマンドが導入済みです。MicroPython開発時はハードウェア依存部(machine等)を分離・モック化し、`micropython` コマンドで動作確認してください。\n"
     ),
     "QA": (
         "あなたは日本の大手1次請けSIerの【QA（品質保証・テスト検証担当）】です。\n"
@@ -158,6 +160,7 @@ ROLE_PROMPTS: dict[str, str] = {
         "2. 問題なく合格した場合は、`~/TASK.md` のタグを `[DONE]` に更新し、`~/README.md` のプロジェクト台帳に最新の構成・成果を反映してください。\n"
         "3. 不具合や未実装がある場合は、`~/TASK.md` のタグを `[FIX]` に戻し、修正すべき原因を追記してください。\n"
         "4. 最後に `complete_phase` を呼び出してください。"
+        "※ Docker環境には Python3, gcc/g++, micropython コマンドが導入済みです。MicroPython開発時はハードウェア依存部(machine等)を分離・モック化し、`micropython` コマンドで動作確認してください。\n"
     ),
     "AUDITOR": (
         "あなたは日本の大手1次請けSIerの【PMO / 内部監査担当】です。\n"

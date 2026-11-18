@@ -6,9 +6,10 @@ from typing import Any
 
 import aiohttp
 
-from src.sandbox.tools import read_workspace_doc
+from sandbox.tools import read_workspace_doc
 
 from .config import (
+    get_desktop_metrics_url,
     get_desktop_ram_gb,
     get_desktop_vram_gb,
     get_model_for_role,
@@ -144,6 +145,28 @@ async def _fetch_ollama_memory() -> dict[str, tuple[float, float]]:
     return result
 
 
+async def _fetch_desktop_metrics() -> dict[str, float] | None:
+    """Ubuntu Server 側のメトリクスエンドポイントから正確な実測値を取得する"""
+    url = get_desktop_metrics_url()
+    if not url:
+        return None
+    timeout = aiohttp.ClientTimeout(total=3)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+    except Exception:
+        pass
+    return None
+
+
+def _format_tok_compact(tokens: int) -> str:
+    if tokens >= 10000:
+        return f"{tokens / 1000:5.1f}k"
+    return f"{tokens:6,d}"
+
+
 def _make_bar(ratio: float, width: int = 10) -> str:
     clamped = max(0.0, min(1.0, ratio))
     filled = int(round(clamped * width))
@@ -181,26 +204,34 @@ def _parse_tasks_from_md() -> list[tuple[str, str]]:
 async def render_status_box() -> str:
     """Discord標準のコードブロック枠のみを使い、横幅・上下行数を固定したダッシュボードを生成する"""
     ps_map = await _fetch_ollama_memory()
-    max_vram = get_desktop_vram_gb()
-    max_ram = get_desktop_ram_gb()
+    hw_metrics = await _fetch_desktop_metrics()
     max_ctx = get_server_ctx_size()
     rpi_free = _get_rpi_free_ram_gb()
 
-    used_vram = sum(v for v, _ in ps_map.values())
-    used_ram = sum(r for _, r in ps_map.values())
+    if hw_metrics:
+        used_vram = float(hw_metrics.get("vram_used_gb", 0.0))
+        max_vram = float(hw_metrics.get("vram_total_gb") or get_desktop_vram_gb())
+        used_ram = float(hw_metrics.get("ram_used_gb", 0.0))
+        max_ram = float(hw_metrics.get("ram_total_gb") or get_desktop_ram_gb())
+        ollama_real_mem = float(hw_metrics.get("ollama_vram_gb", 0.0)) + float(hw_metrics.get("ollama_ram_gb", 0.0))
+    else:
+        max_vram = get_desktop_vram_gb()
+        max_ram = get_desktop_ram_gb()
+        used_vram = sum(v for v, _ in ps_map.values())
+        used_ram = sum(r for _, r in ps_map.values())
+        ollama_real_mem = 0.0
+
     free_vram = max(0.0, max_vram - used_vram)
     free_ram = max(0.0, max_ram - used_ram)
-
     vram_pct = (used_vram / max_vram) * 100 if max_vram else 0.0
     ram_pct = (used_ram / max_ram) * 100 if max_ram else 0.0
 
-    # 横幅を常に一定に広げるための1行セパレータ（半角84文字）
     divider = f"{C_GRAY}{'─' * 84}{C_RESET}"
 
     lines: list[str] = [
         f"{C_GREEN}● SIer MULTI-AGENT MONITOR{C_RESET}  |  Active: {C_CYAN}{telemetry.active_role:<8}{C_RESET}  |  {now_jst_str()}",
         divider,
-        f"{C_BOLD}[HARDWARE & MEMORY]{C_RESET} Desktop ({max_vram:.0f}GB VRAM + {max_ram:.0f}GB RAM)  |  RPi4 Free: {rpi_free:.1f}GB",
+        f"{C_BOLD}[HARDWARE & MEMORY]{C_RESET} Ubuntu ({max_vram:.0f}GB VRAM + {max_ram:.0f}GB RAM)  |  RPi4 Free: {rpi_free:.1f}GB",
         f"  VRAM : [{_make_bar(used_vram / max_vram, 14)}] {used_vram:5.1f} / {max_vram:4.1f} GB ({vram_pct:4.1f}%)  |  Free: {free_vram:5.1f} GB",
         f"  RAM  : [{_make_bar(used_ram / max_ram, 14)}] {used_ram:5.1f} / {max_ram:4.1f} GB ({ram_pct:4.1f}%)  |  Free: {free_ram:5.1f} GB",
         "",
@@ -215,13 +246,21 @@ async def render_status_box() -> str:
             model = "none"
 
         v_gb, r_gb = ps_map.get(model, (0.0, 0.0))
-        if v_gb == 0.0 and r_gb == 0.0:
+        is_loaded = (v_gb + r_gb) > 0.0
+        if not is_loaded:
             for loaded_name, mem_pair in ps_map.items():
                 if model.lower() in loaded_name.lower() or loaded_name.lower() in model.lower():
                     v_gb, r_gb = mem_pair
+                    is_loaded = True
                     break
 
-        role_mem = v_gb + r_gb
+        ps_mem = v_gb + r_gb
+        # ロード中のモデルが1種類のみ、かつ実測値が取れている場合は実プロセス消費量を優先表示
+        if is_loaded and len(ps_map) == 1 and ollama_real_mem > 0:
+            role_mem = max(ps_mem, ollama_real_mem)
+        else:
+            role_mem = ps_mem
+
         mem_pct = (role_mem / total_sys_mem) * 100 if total_sys_mem else 0.0
         ctx_tok = telemetry.role_ctx_tokens.get(role, 0)
         ctx_ratio = ctx_tok / max_ctx if max_ctx else 0.0
@@ -234,7 +273,7 @@ async def render_status_box() -> str:
         row_str = (
             f"  {mark} {role:<7} ({short_model})  "
             f"Mem: {role_mem:4.1f}GB ({mem_pct:2.0f}%)  |  "
-            f"CTX: [{_make_bar(ctx_ratio, 8)}] {ctx_tok:6,d} ({ctx_ratio*100:4.1f}%)"
+            f"CTX: [{_make_bar(ctx_ratio, 8)}] {_format_tok_compact(ctx_tok)} ({ctx_ratio*100:4.1f}%)"
         )
         lines.append(f"{color}{row_str}{C_RESET}")
 
@@ -250,7 +289,7 @@ async def render_status_box() -> str:
             break
 
         if status == "DONE":
-            task_lines.append(f"{C_GRAY}{_truncate_line(f'  ✔ [DONE] {title}')}{C_RESET}")
+            task_lines.append(f"{C_GREEN}{_truncate_line(f'  ✔ [DONE] {title}')}{C_RESET}")
         elif idx == active_idx:
             task_lines.append(f"{C_YELLOW}{_truncate_line(f'  ▶ [{status}] {title}')}{C_RESET}")
 
@@ -268,7 +307,7 @@ async def render_status_box() -> str:
             task_lines.append(f"{C_WHITE}{_truncate_line(f'  - [{status}] {title}')}{C_RESET}")
 
     if not task_lines:
-        task_lines.append(f"{C_GRAY}  (現在登録されているタスクはありません){C_RESET}")
+        task_lines.append(f"{C_WHITE}  (現在登録されているタスクはありません){C_RESET}")
 
     # 上下幅（行数）を常に一定に保つための空白パディング行
     while len(task_lines) < TOTAL_TASK_SECTION_LINES:

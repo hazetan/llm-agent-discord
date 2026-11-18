@@ -140,9 +140,10 @@ async def chat_step(
 ) -> tuple[dict[str, Any], float, str]:
     """Ollama ネイティブ /api/chat で推論を実行し、Thinking とツール呼び出しを取得する"""
     model_name = get_model_for_role(role)
+    prepared_msgs = _prepare_messages_for_ollama(messages)
     payload: dict[str, Any] = {
         "model": model_name,
-        "messages": _prepare_messages_for_ollama(messages),
+        "messages": prepared_msgs,
         "stream": False,
     }
 
@@ -161,6 +162,13 @@ async def chat_step(
     if tools:
         payload["tools"] = tools
 
+    # 1. 推論開始直前に入力コンテキスト長（概算）を即座に記録（待機中でも0にならないようにする）
+    est_chars = len(json.dumps(prepared_msgs, ensure_ascii=False))
+    if tools:
+        est_chars += len(json.dumps(tools, ensure_ascii=False))
+    est_input_tok = max(1, est_chars // 3)
+    telemetry.update_role_tokens(role, est_input_tok)
+
     start_t = time.perf_counter()
     timeout = aiohttp.ClientTimeout(total=get_llm_timeout())
 
@@ -178,10 +186,11 @@ async def chat_step(
             if resp.status != 200 or "message" not in data:
                 raise RuntimeError(f"Ollama Error ({resp.status}, model={model_name}): {data}")
 
-            # ネイティブ /api/chat のトークン数を集計してテレメトリへ記録
+            # 2. 推論完了後に Ollama からの正確な実測トークン数で上書き更新
             prompt_tok = int(data.get("prompt_eval_count") or 0)
             eval_tok = int(data.get("eval_count") or 0)
-            telemetry.update_role_tokens(role, prompt_tok + eval_tok)
+            api_total_tok = prompt_tok + eval_tok
+            telemetry.update_role_tokens(role, max(api_total_tok, est_input_tok))
 
             msg = data["message"]
             raw_content = msg.get("content") or ""
@@ -194,7 +203,6 @@ async def chat_step(
                 if fb_calls:
                     msg["tool_calls"] = fb_calls
 
-            # 次ステップの履歴送信用にはクリーンな本文を保持し、ログ・log-raw 表示用には思考過程を含める
             msg["_clean_content"] = clean_content
             if thinking_text and clean_content:
                 msg["content"] = f"[Thinking]\n{thinking_text}\n\n[Response]\n{clean_content}"

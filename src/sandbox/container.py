@@ -5,7 +5,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from src.core.config import (
+from core.config import (
     get_command_timeout,
     get_docker_image,
     get_docker_mem_limit,

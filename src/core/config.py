@@ -258,3 +258,6 @@ def get_samba_enable() -> bool:
 
 def get_samba_port() -> int:
     return get_env_int("SAMBA_PORT", 445) or 445
+
+def get_desktop_metrics_url() -> str | None:
+    return get_env_str("DESKTOP_METRICS_URL")

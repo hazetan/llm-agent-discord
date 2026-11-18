@@ -8,7 +8,7 @@ from typing import Any
 
 from ddgs import DDGS
 
-from src.core.config import get_workspace_dir
+from core.config import get_workspace_dir
 
 from .container import (
     IGNORE_DIRS,

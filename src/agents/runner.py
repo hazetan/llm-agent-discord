@@ -1,10 +1,10 @@
 from typing import Any
 
-from src.core.config import get_max_steps_per_phase
-from src.core.llm_client import chat_step
-from src.core.logger import RoleLogger
-from src.core.telemetry import telemetry
-from src.sandbox.tools import execute_tool, parse_tool_args, read_workspace_doc
+from core.config import get_max_steps_per_phase
+from core.llm_client import chat_step
+from core.logger import RoleLogger
+from core.telemetry import telemetry
+from sandbox.tools import execute_tool, parse_tool_args, read_workspace_doc
 
 from .roles import ROLE_ALLOWED_TOOLS, ROLE_PROMPTS, get_tools_for_role
 

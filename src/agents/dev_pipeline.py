@@ -3,8 +3,8 @@ import re
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-from src.core.config import get_pipeline_idle_sec
-from src.sandbox.tools import read_workspace_doc
+from core.config import get_pipeline_idle_sec
+from sandbox.tools import read_workspace_doc
 
 from .runner import run_role_phase
 

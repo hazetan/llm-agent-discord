@@ -13,7 +13,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from src.sandbox.container import (
+from sandbox.container import (
     IGNORE_DIRS,
     export_workspace_zip,
     resolve_workspace_path,

@@ -3,11 +3,11 @@ import re
 
 import discord
 
-from src.agents.auditor_agent import continuous_auditor_loop
-from src.agents.dev_pipeline import continuous_dev_pipeline_loop
-from src.agents.pm_agent import handle_client_message
-from src.core.config import get_monitored_channel_ids
-from src.core.nas_server import nas_server
+from agents.auditor_agent import continuous_auditor_loop
+from agents.dev_pipeline import continuous_dev_pipeline_loop
+from agents.pm_agent import handle_client_message
+from core.config import get_monitored_channel_ids
+from core.nas_server import nas_server
 
 from .status_monitor import LiveStatusMonitor
 
