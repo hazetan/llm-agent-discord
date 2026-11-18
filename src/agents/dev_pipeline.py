@@ -41,7 +41,7 @@ async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None 
             )
             summary, _ = await run_role_phase(role, instruction)
 
-            if on_phase_complete:
+            if on_phase_complete and summary.strip():
                 await on_phase_complete(f"**[{role} 部門 完了報告]**\n{summary}")
 
         except asyncio.CancelledError:

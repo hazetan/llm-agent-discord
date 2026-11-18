@@ -64,8 +64,6 @@ async def run_role_phase(role: str, instruction: str, max_steps: int | None = No
                 if telemetry.on_raw_update:
                     await telemetry.on_raw_update()
 
-                if thought:
-                    final_summary = thought
                 messages.append({
                     "role": "user",
                     "content": "ツールを直接呼び出して作業を進めるか、`complete_phase` を呼び出して完了してください。",
@@ -107,6 +105,6 @@ async def run_role_phase(role: str, instruction: str, max_steps: int | None = No
             if phase_done:
                 break
 
-        return final_summary or f"{role} フェーズが完了しました。", created_zips
+        return final_summary, created_zips
     finally:
         telemetry.set_active_role("IDLE")

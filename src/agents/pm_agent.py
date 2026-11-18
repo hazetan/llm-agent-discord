@@ -19,4 +19,4 @@ async def handle_client_message(user_message: str) -> tuple[str, list[Path]]:
         )
         summary, zip_strs = await run_role_phase("PM", instruction, max_steps=10)
         zip_paths = [Path(p) for p in zip_strs if Path(p).exists()]
-        return summary, zip_paths
+        return summary or "内容を確認し、タスクファイルを更新しました。", zip_paths
