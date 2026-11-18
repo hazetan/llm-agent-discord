@@ -1,6 +1,4 @@
-discord
-sqlalchemy
-dotenv
-ddgs
+discord.py
 aiohttp
-docker
+python-dotenv
+ddgs

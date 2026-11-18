@@ -1,10 +1,9 @@
 # Custom
 log/
 .venv
-.database/
-llm_models
-llama_cpp
+.database
 workspace
+run
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
