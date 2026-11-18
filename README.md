@@ -3,7 +3,7 @@
 ## 1. プロジェクト概要
 - ローカルLLM（Ollama）をバックエンドとし、**日本の1次請けSIerの開発体制（PM / SE / PG / QA / AUDITOR）**を再現した自律型マルチエージェントシステムを Discord Bot として動作させる。
 - データベース（SQLite）を使用せず、ワークスペース（エージェント視点では `~/`）直下の4つの標準ドキュメント（`README.md`, `TASK.md`, `DESIGN.md`, `REPORT.md`）を単一の真実のソースとして工程分業で開発を継続する。
-- 隔離された Docker サンドボックス環境内で、要件定義・設計・実装・結合テスト・内部監査を自律的に遂行する。
+- 隔離された Docker サンドボックス環境内で、要件定義・設計・実装・結合テスト・内部監査を自律的に遂行する。`Dockerfile.sandbox` の拡張により Python / C / C++ / MicroPython / OpenSCAD（3Dモデル `.stl` 生成）等にも柔軟に対応可能。
 - ワークスペース全体を **NAS（Web UI / WebDAV / Samba）** として公開し、PC・スマートフォンから直接ファイルの閲覧・編集・取得が可能。
 
 ---
@@ -19,10 +19,10 @@
 
 ### リアルタイム可視化モニター（稼働中のみ表示）
 - **稼働状況モニターBox**: 指定チャンネルに固定サイズ（ANSIカラー対応）のダッシュボードを表示し、数分おきに自動更新する（Bot停止時に自動削除）。
-  - Ollama サーバーの VRAM / RAM 消費量・空き容量、実行ホスト（Raspberry Pi 等）の空きメモリ
+  - GPUホスト（Ollamaサーバー）のリアルな VRAM / RAM 消費量・空き容量（`tools/desktop_metrics_server.py` 連携、未設定時は `/api/ps` へフォールバック）および Bot ホストの空きメモリ
   - 各役職ごとのメモリ消費割合・コンテキスト長占有率
   - 過去・現在・未来のタスクパイプラインと、進行中タスクの実行ブランチツリー
-- **リアルタイム生ログBox (`log-raw`)**: モデルの思考プロセス、実行ツール引数、コマンドの生出力をステップごとにリアルタイムで固定枠内に表示する。
+- **リアルタイム生ログBox (`log-raw`)**: モデルの Thinking（思考プロセス）、実行ツール引数、コマンドの生出力をステップごとにリアルタイムで固定枠内に表示する。
 
 ### 統合ワークスペース NAS
 - `workspace/` を以下の3プロトコルで共有可能（Cloudflare Tunnel 等を介した外部公開にも対応）。
@@ -35,16 +35,23 @@
 ## 3. ディレクトリ構成
 ```text
 .
-├── .env.example             # 環境変数テンプレート
+├── .env.example                 # 環境変数テンプレート
+├── Dockerfile.sandbox.example   # サンドボックス用Dockerfileテンプレート（MicroPython / 3D CAD対応可）
+├── requirements.txt             # Python依存パッケージ一覧
+├── setup.sh                     # 初回セットアップスクリプト
+├── run.sh                       # Bot起動スクリプト
 ├── src/
-│   ├── agents/              # 5役職エージェント（PM, SE, PG, QA, AUDITOR）とパイプライン制御
-│   ├── core/                # 設定管理, Ollama通信, 構造化ロガー, テレメトリ, NASサーバー
-│   ├── discord_app/         # Discord Bot本体, ライブステータスBox監視
-│   └── sandbox/             # Dockerサンドボックス管理, ツール実行, パス正規化
-├── workspace/               # エージェントの作業領域（コンテナ内では ~/ にマウント）
-├── exports/                 # 生成されたZIPアーカイブ出力先
-├── logs/                    # 役職別の稼働ログ出力先（pm.log, se.log, pg.log, qa.log, auditor.log）
-└── main.py                  # エントリーポイント
+│   ├── main.py                  # エントリーポイント
+│   ├── agents/                  # 5役職エージェント（PM, SE, PG, QA, AUDITOR）とパイプライン制御
+│   ├── core/                    # 設定管理, Ollama通信, 構造化ロガー, テレメトリ, NASサーバー
+│   ├── discord_app/             # Discord Bot本体, ライブステータスBox監視
+│   └── sandbox/                 # Dockerサンドボックス管理, ツール実行, パス正規化
+├── tools/
+│   ├── desktop_metrics_server.py # GPU/LLMサーバー側の実VRAM/RAM取得用軽量HTTPサーバー
+│   └── start_metrics.sh         # メトリクスサーバー起動スクリプト
+├── workspace/                   # エージェントの作業領域（コンテナ内では ~/ にマウント）
+├── exports/                     # 生成されたZIPアーカイブ出力先
+└── logs/                        # 役職別の稼働ログ出力先（pm.log, se.log, pg.log, qa.log, auditor.log）
 ```
 
 ---
@@ -55,7 +62,7 @@
 - **インフラ・環境**:
   - Docker（コード実行サンドボックス ＆ Alpineベース Samba コンテナ）
   - 組み込み WebUI / WebDAV サーバー（`aiohttp`）
-- **LLMバックエンド**: Ollama（OpenAI互換 `/v1/chat/completions` および `/api/ps` リソース監視）
+- **LLMバックエンド**: Ollama ネイティブ `/api/chat`（Thinking モード・各種生成パラメータ制御）および `/api/ps`
 - **外部API**: DuckDuckGo（Web検索・Webページ取得）
 
 ---
@@ -69,35 +76,34 @@
    ```
    *(反映のため一度再ログインしてください)*
 
-2. **サンドボックス用 Docker イメージの取得**
+2. **セットアップスクリプトの実行**
+   仮想環境の作成、依存ライブラリのインストール、`.env` および `Dockerfile.sandbox` の雛形生成、Dockerイメージのビルドを一括で行います。
    ```bash
-   docker pull python:3.12-slim
-   # Samba機能（SAMBA_ENABLE=True）を使用する場合
-   docker pull alpine:latest
+   chmod +x setup.sh run.sh tools/start_metrics.sh
+   ./setup.sh
    ```
 
-3. **Python 仮想環境の構築と依存ライブラリのインストール**
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-4. **環境変数（`.env`）の設定**
-   `.env.example` をコピーして `.env` を作成し、ご自身の環境に合わせて設定してください（モデル名や認証情報はすべて `.env` で管理されます）。
-   ```bash
-   cp .env.example .env
-   ```
+3. **環境変数（`.env`）の設定**
+   生成された `.env` を編集し、ご自身の環境に合わせて設定してください（モデル名や認証情報はすべて `.env` で管理されます）。
    主な設定項目：
    - `DISCORD_TOKEN` : Discord Bot トークン
    - `DISCORD_CHANNEL_IDS` : 自動反応するテキスト／フォーラムチャンネルID（カンマ区切り）
    - `DISCORD_STATUS_CHANNEL_ID` / `DISCORD_RAW_LOG_CHANNEL_ID` : 監視Box表示用チャンネルID
    - `OLLAMA_BASE_URL` : Ollama サーバーのURL（例: `http://192.168.x.x:11434`）
    - `MODEL_MAIN` / `MODEL_PM` / `MODEL_SE` / `MODEL_PG` / `MODEL_QA` / `MODEL_AUDITOR` : 使用する Ollama モデル名
+   - `OLLAMA_THINK` / `THINK_PROMPT_BOOST` / `SERVER_CTX_SIZE` / `MAX_TOKEN` : Thinking モード・生成パラメータ設定
+   - `SANDBOX_ENV_HINT` : カスタムしたサンドボックス内の利用可能ツールをエージェントへ伝える任意のヒント文
+   - `DESKTOP_METRICS_URL` : GPUサーバーの実VRAM/RAMを取得する場合のURL（例: `http://192.168.x.x:11435/metrics`）
    - `NAS_ENABLE`, `NAS_PORT`, `NAS_USER`, `NAS_PASSWORD`, `SAMBA_ENABLE` : NAS・Samba 設定
 
-5. **起動**
+4. **（任意）GPU / Ollama サーバー側でメトリクスサーバーを起動**
+   Bot と別マシンで Ollama を動かしており、正確な VRAM / RAM 実測値をモニターに表示したい場合は、GPU サーバー側で以下を実行します。
    ```bash
-   PYTHONPATH=src python src/main.py
+   ./tools/start_metrics.sh
    ```
-   *(または実行スクリプト `./run` に権限を付与して `tmux` 上で起動)*
+
+5. **Bot の起動**
+   `tmux` 等の上で以下を実行して起動します。
+   ```bash
+   ./run.sh
+   ```
