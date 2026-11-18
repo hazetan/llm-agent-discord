@@ -7,21 +7,49 @@ from typing import Any
 import aiohttp
 
 from .config import (
-    get_chat_completions_url,
     get_llm_timeout,
     get_model_for_role,
-    get_sampling_params,
+    get_ollama_chat_url,
+    get_ollama_keep_alive,
+    get_ollama_options,
+    get_ollama_think,
+    get_think_prompt_boost,
 )
 from .telemetry import telemetry
 
+HIGH_THINKING_DIRECTIVE = (
+    "\n\n【最高レベル思考プロセス (Deep Thinking) 指示】\n"
+    "ツールを呼び出す前に、必ず現在の状況・ディレクトリ構造・問題の本質・影響範囲・エッジケースを"
+    "最高レベルの深さで段階的に思考（Thinking）し、論理的な整合性を検証してから行動してください。"
+)
 
-def strip_thinking_tokens(text: str) -> str:
-    if not text:
-        return ""
-    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    if "<think>" in cleaned and "</think>" not in cleaned:
-        cleaned = cleaned.split("<think>")[0]
-    return cleaned.strip()
+
+def extract_thinking_and_clean(raw_content: str, explicit_thinking: str = "") -> tuple[str, str]:
+    """
+    レスポンスから (思考テキスト, クリーンな本文) を分離・抽出する。
+    """
+    think_parts: list[str] = []
+    if explicit_thinking and explicit_thinking.strip():
+        think_parts.append(explicit_thinking.strip())
+
+    if raw_content:
+        tag_matches = re.findall(r"<think>(.*?)</think>", raw_content, flags=re.DOTALL)
+        for m in tag_matches:
+            if m.strip():
+                think_parts.append(m.strip())
+
+        cleaned = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL)
+        if "<think>" in cleaned and "</think>" not in cleaned:
+            prefix, unclosed_think = cleaned.split("<think>", 1)
+            if unclosed_think.strip():
+                think_parts.append(unclosed_think.strip())
+            cleaned = prefix
+        cleaned = cleaned.strip()
+    else:
+        cleaned = ""
+
+    combined_think = "\n".join(think_parts).strip()
+    return combined_think, cleaned
 
 
 def _parse_json_lenient(raw: str) -> Any | None:
@@ -68,8 +96,8 @@ def extract_fallback_tool_calls(content: str) -> list[dict[str, Any]]:
         for item in items:
             if isinstance(item, dict) and "name" in item:
                 args = item.get("arguments", item.get("args", {}))
-                if not isinstance(args, str):
-                    args = json.dumps(args, ensure_ascii=False)
+                if isinstance(args, str):
+                    args = _parse_json_lenient(args) or {}
                 calls.append({
                     "id": f"fallback_call_{idx}",
                     "type": "function",
@@ -78,44 +106,102 @@ def extract_fallback_tool_calls(content: str) -> list[dict[str, Any]]:
     return calls
 
 
+def _prepare_messages_for_ollama(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ollama /api/chat 向けにメッセージ配列と tool_calls の arguments (dict形式) を正規化する"""
+    prepared: list[dict[str, Any]] = []
+    boost = get_think_prompt_boost()
+
+    for idx, m in enumerate(messages):
+        msg_copy: dict[str, Any] = {
+            "role": m.get("role", "user"),
+            "content": m.get("_clean_content", m.get("content") or ""),
+        }
+        if idx == 0 and msg_copy["role"] == "system" and boost:
+            msg_copy["content"] += HIGH_THINKING_DIRECTIVE
+
+        if "tool_calls" in m and m["tool_calls"]:
+            norm_calls = []
+            for tc in m["tool_calls"]:
+                fn = dict(tc.get("function", {}))
+                raw_args = fn.get("arguments", {})
+                if isinstance(raw_args, str):
+                    fn["arguments"] = _parse_json_lenient(raw_args) or {}
+                norm_calls.append({"function": fn})
+            msg_copy["tool_calls"] = norm_calls
+
+        prepared.append(msg_copy)
+    return prepared
+
+
 async def chat_step(
     role: str,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], float, str]:
-    """指定された役職のモデルで1ステップの推論を実行する"""
+    """Ollama ネイティブ /api/chat で推論を実行し、Thinking とツール呼び出しを取得する"""
     model_name = get_model_for_role(role)
     payload: dict[str, Any] = {
         "model": model_name,
-        "messages": messages,
+        "messages": _prepare_messages_for_ollama(messages),
         "stream": False,
-        **get_sampling_params(),
     }
+
+    think_setting = get_ollama_think()
+    if think_setting is not None:
+        payload["think"] = think_setting
+
+    options = get_ollama_options()
+    if options:
+        payload["options"] = options
+
+    keep_alive = get_ollama_keep_alive()
+    if keep_alive:
+        payload["keep_alive"] = keep_alive
+
     if tools:
         payload["tools"] = tools
-        payload["tool_choice"] = "auto"
 
     start_t = time.perf_counter()
     timeout = aiohttp.ClientTimeout(total=get_llm_timeout())
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(get_chat_completions_url(), json=payload) as resp:
+        async with session.post(get_ollama_chat_url(), json=payload) as resp:
             data = await resp.json()
-            if resp.status != 200 or "choices" not in data:
+
+            # もしモデルが "high"/"max" 等の文字列レベル指定に非対応で 400 を返した場合、think=True で自動再試行
+            if resp.status == 400 and isinstance(think_setting, str):
+                payload["think"] = True
+                async with session.post(get_ollama_chat_url(), json=payload) as retry_resp:
+                    resp = retry_resp
+                    data = await retry_resp.json()
+
+            if resp.status != 200 or "message" not in data:
                 raise RuntimeError(f"Ollama Error ({resp.status}, model={model_name}): {data}")
 
-            # コンテキスト消費トークン数を記録
-            usage = data.get("usage") or {}
-            total_tok = usage.get("total_tokens") or usage.get("prompt_tokens") or 0
-            telemetry.update_role_tokens(role, int(total_tok))
+            # ネイティブ /api/chat のトークン数を集計してテレメトリへ記録
+            prompt_tok = int(data.get("prompt_eval_count") or 0)
+            eval_tok = int(data.get("eval_count") or 0)
+            telemetry.update_role_tokens(role, prompt_tok + eval_tok)
 
-            msg = data["choices"][0]["message"]
+            msg = data["message"]
             raw_content = msg.get("content") or ""
-            if not msg.get("tool_calls") and raw_content:
-                fb_calls = extract_fallback_tool_calls(raw_content)
+            explicit_thinking = msg.get("thinking") or msg.get("reasoning") or ""
+
+            thinking_text, clean_content = extract_thinking_and_clean(raw_content, explicit_thinking)
+
+            if not msg.get("tool_calls") and clean_content:
+                fb_calls = extract_fallback_tool_calls(clean_content)
                 if fb_calls:
                     msg["tool_calls"] = fb_calls
-            msg["content"] = strip_thinking_tokens(raw_content)
+
+            # 次ステップの履歴送信用にはクリーンな本文を保持し、ログ・log-raw 表示用には思考過程を含める
+            msg["_clean_content"] = clean_content
+            if thinking_text and clean_content:
+                msg["content"] = f"[Thinking]\n{thinking_text}\n\n[Response]\n{clean_content}"
+            elif thinking_text:
+                msg["content"] = thinking_text
+            else:
+                msg["content"] = clean_content
 
     latency = time.perf_counter() - start_t
     return msg, latency, model_name

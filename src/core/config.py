@@ -73,8 +73,8 @@ def get_ollama_base_url() -> str:
     return base.rstrip("/")
 
 
-def get_chat_completions_url() -> str:
-    return f"{get_ollama_base_url()}/v1/chat/completions"
+def get_ollama_chat_url() -> str:
+    return f"{get_ollama_base_url()}/api/chat"
 
 
 def get_model_for_role(role: str) -> str:
@@ -88,22 +88,66 @@ def get_model_for_role(role: str) -> str:
     return model
 
 
-def get_sampling_params() -> dict[str, Any]:
-    params: dict[str, Any] = {}
-    temp = get_env_float("LLM_TEMP")
-    top_p = get_env_float("LLM_TOP_P")
-    max_tokens = get_env_int("MAX_TOKEN")
-    ctx_size = get_env_int("SERVER_CTX_SIZE")
+def get_ollama_think() -> bool | str | None:
+    """OLLAMA_THINK の設定値を bool または文字列 ('high', 'max' 等) として返す"""
+    raw = get_env_str("OLLAMA_THINK")
+    if raw is None:
+        return None
+    low = raw.lower()
+    if low in ("true", "1", "yes", "on"):
+        return True
+    if low in ("false", "0", "no", "off"):
+        return False
+    return low  # "high", "medium", "low", "max" など
 
-    if temp is not None:
-        params["temperature"] = temp
-    if top_p is not None:
-        params["top_p"] = top_p
-    if max_tokens is not None:
-        params["max_tokens"] = max_tokens
-    if ctx_size is not None:
-        params["options"] = {"num_ctx": ctx_size}
-    return params
+
+def get_think_prompt_boost() -> bool:
+    raw = get_env_str("THINK_PROMPT_BOOST")
+    if raw is None:
+        return False
+    return raw.lower() in ("true", "1", "yes", "on")
+
+
+def get_ollama_keep_alive() -> str | None:
+    return get_env_str("OLLAMA_KEEP_ALIVE")
+
+
+def get_ollama_options() -> dict[str, Any]:
+    """
+    .env に設定されている Ollama パラメータのみを辞書として構築する。
+    デフォルト値はすべて None とし、未設定の項目は送信しない。
+    """
+    opts: dict[str, Any] = {}
+
+    int_mappings = {
+        "SERVER_CTX_SIZE": "num_ctx",
+        "MAX_TOKEN": "num_predict",
+        "LLM_TOP_K": "top_k",
+        "LLM_REPEAT_LAST_N": "repeat_last_n",
+        "LLM_SEED": "seed",
+        "OLLAMA_NUM_GPU": "num_gpu",
+        "OLLAMA_NUM_THREAD": "num_thread",
+        "OLLAMA_NUM_BATCH": "num_batch",
+    }
+    for env_key, opt_key in int_mappings.items():
+        val = get_env_int(env_key)
+        if val is not None:
+            opts[opt_key] = val
+
+    float_mappings = {
+        "LLM_TEMP": "temperature",
+        "LLM_TOP_P": "top_p",
+        "LLM_MIN_P": "min_p",
+        "LLM_REPEAT_PENALTY": "repeat_penalty",
+        "LLM_PRESENCE_PENALTY": "presence_penalty",
+        "LLM_FREQ_PENALTY": "frequency_penalty",
+    }
+    for env_key, opt_key in float_mappings.items():
+        val = get_env_float(env_key)
+        if val is not None:
+            opts[opt_key] = val
+
+    return opts
 
 
 def get_llm_timeout() -> int:
