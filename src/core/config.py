@@ -261,3 +261,6 @@ def get_samba_port() -> int:
 
 def get_desktop_metrics_url() -> str | None:
     return get_env_str("DESKTOP_METRICS_URL")
+
+def get_sandbox_env_hint() -> str | None:
+    return get_env_str("SANDBOX_ENV_HINT")

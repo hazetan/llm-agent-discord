@@ -19,7 +19,12 @@ if [ ! -f ".env" ] && [ -f ".env.example" ]; then
     echo "[Info] Created .env from .env.example. Please edit .env before running."
 fi
 
-echo "=== 4. Building Docker sandbox image (sier-sandbox:latest) ==="
+echo "=== 4. Building Docker sandbox image ==="
+if [ ! -f "Dockerfile.sandbox" ] && [ -f "Dockerfile.sandbox.example" ]; then
+    cp Dockerfile.sandbox.example Dockerfile.sandbox
+    echo "[Info] Created Dockerfile.sandbox from Dockerfile.sandbox.example."
+fi
+
 if [ -f "Dockerfile.sandbox" ]; then
     docker build -f Dockerfile.sandbox -t sier-sandbox:latest .
 else

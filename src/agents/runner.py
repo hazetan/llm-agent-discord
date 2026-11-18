@@ -1,6 +1,6 @@
 from typing import Any
 
-from core.config import get_max_steps_per_phase
+from core.config import get_max_steps_per_phase, get_sandbox_env_hint
 from core.llm_client import chat_step
 from core.logger import RoleLogger
 from core.telemetry import telemetry
@@ -33,8 +33,14 @@ async def run_role_phase(role: str, instruction: str, max_steps: int | None = No
     logger = RoleLogger(role)
     tools = get_tools_for_role(ROLE_ALLOWED_TOOLS[role])
 
+    system_prompt = ROLE_PROMPTS[role]
+    if role in ("SE", "PG", "QA"):
+        env_hint = get_sandbox_env_hint()
+        if env_hint:
+            system_prompt += f"\n\n{env_hint}"
+
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": ROLE_PROMPTS[role]},
+        {"role": "system", "content": system_prompt},
         {"role": "system", "content": build_fresh_workspace_snapshot()},
         {"role": "user", "content": instruction},
     ]
