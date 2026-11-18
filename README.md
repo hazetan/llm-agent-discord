@@ -37,14 +37,14 @@
 .
 ├── .env.example             # 環境変数テンプレート
 ├── src/
-│   ├── main.py              # エントリーポイント
 │   ├── agents/              # 5役職エージェント（PM, SE, PG, QA, AUDITOR）とパイプライン制御
 │   ├── core/                # 設定管理, Ollama通信, 構造化ロガー, テレメトリ, NASサーバー
 │   ├── discord_app/         # Discord Bot本体, ライブステータスBox監視
 │   └── sandbox/             # Dockerサンドボックス管理, ツール実行, パス正規化
 ├── workspace/               # エージェントの作業領域（コンテナ内では ~/ にマウント）
 ├── exports/                 # 生成されたZIPアーカイブ出力先
-└── logs/                    # 役職別の稼働ログ出力先（pm.log, se.log, pg.log, qa.log, auditor.log）
+├── logs/                    # 役職別の稼働ログ出力先（pm.log, se.log, pg.log, qa.log, auditor.log）
+└── main.py                  # エントリーポイント
 ```
 
 ---
