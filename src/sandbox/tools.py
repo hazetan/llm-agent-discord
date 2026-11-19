@@ -41,6 +41,47 @@ INITIAL_DOCUMENTS: dict[str, str] = {
 }
 
 
+SKIP_EXTENSIONS = {
+    ".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".exe", ".bin", ".o", ".a",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg", ".mp3", ".mp4", ".wav",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".pdf", ".woff", ".woff2", ".ttf", ".eot",
+    ".db", ".sqlite", ".sqlite3", ".pkl", ".pt", ".pth", ".onnx", ".safetensors", ".gguf", ".lock",
+}
+
+
+MAX_BATCH_READ_CHARS = 150_000
+MAX_SINGLE_FILE_BYTES = 512 * 1024
+
+
+def _is_readable_text_file(path: Path, allowed_exts: set[str] | None = None) -> bool:
+    """バイナリ・巨大ファイル・対象外拡張子を除外する"""
+    if not path.is_file():
+        return False
+    ext = path.suffix.lower()
+    if allowed_exts is not None:
+        return ext in allowed_exts
+    if ext in SKIP_EXTENSIONS:
+        return False
+    try:
+        if path.stat().st_size > MAX_SINGLE_FILE_BYTES:
+            return False
+        with path.open("rb") as f:
+            chunk = f.read(512)
+            if b"\x00" in chunk:
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def _format_with_line_numbers(lines: list[str], start_line: int = 1) -> str:
+    """各行の左側に1始まりの行番号 ('   1 | ...') を付与する"""
+    if not lines:
+        return "(Empty file)"
+    width = max(4, len(str(start_line + len(lines) - 1)))
+    return "\n".join(f"{idx:>{width}} | {line}" for idx, line in enumerate(lines, start=start_line))
+
+
 def init_workspace_files(reset_on_restart: bool = False) -> None:
     """起動時に ~/ 内の社内標準ドキュメント4点を整備する"""
     ws = get_workspace_dir()
@@ -82,14 +123,109 @@ def _tool_read_file(args: dict[str, Any]) -> str:
     if not target or not target.exists():
         return f"Error: File '{raw_path}' not found inside ~/."
     if target.is_dir():
-        return f"Error: '{raw_path}' is a directory. Use 'list_files' instead."
+        return f"Error: '{raw_path}' is a directory. Use 'read_files' or 'list_files' instead."
 
-    max_lines = int(args.get("max_lines", 250))
     lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
-    body = "\n".join(lines[:max_lines])
-    if len(lines) > max_lines:
-        body += f"\n...(truncated after {max_lines} of {len(lines)} lines)..."
-    return body or "(Empty file)"
+    total = len(lines)
+    start_line = max(1, int(args.get("start_line", 1)))
+    max_lines = int(args.get("max_lines", 500))
+    end_line = int(args.get("end_line", start_line + max_lines - 1))
+    end_line = min(total, max(start_line, end_line))
+
+    rel = target.relative_to(get_workspace_dir().resolve())
+    if total == 0:
+        return f"=== FILE: ~/{rel} (0 lines) ===\n(Empty file)"
+
+    sliced = lines[start_line - 1 : end_line]
+    header = f"=== FILE: ~/{rel} (lines {start_line}-{end_line} of {total}) ==="
+    body = _format_with_line_numbers(sliced, start_line=start_line)
+    if end_line < total:
+        body += f"\n...({total - end_line} more lines not shown)..."
+    return f"{header}\n{body}"
+
+
+def _tool_read_files(args: dict[str, Any]) -> str:
+    """複数ファイルまたはディレクトリ配下のファイルを区切り文字＋左側行番号付きで一括閲覧する"""
+    ws = get_workspace_dir().resolve()
+    raw_paths = args.get("paths") or []
+    if isinstance(raw_paths, str):
+        raw_paths = [p.strip() for p in raw_paths.split(",") if p.strip()]
+
+    raw_dir = args.get("directory")
+    if not raw_paths and not raw_dir:
+        raw_dir = "~/"
+
+    raw_exts = args.get("extensions")
+    allowed_exts: set[str] | None = None
+    if raw_exts:
+        if isinstance(raw_exts, str):
+            raw_exts = [e.strip() for e in raw_exts.split(",") if e.strip()]
+        allowed_exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in raw_exts}
+
+    max_lines_per_file = int(args.get("max_lines_per_file", 500))
+    collected: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add_candidate(p: Path) -> None:
+        resolved = p.resolve()
+        if resolved not in seen and _is_readable_text_file(resolved, allowed_exts):
+            seen.add(resolved)
+            collected.append(resolved)
+
+    def _walk_dir(d: Path) -> None:
+        for root, dirs, files in os.walk(d):
+            dirs[:] = sorted(x for x in dirs if x not in IGNORE_DIRS and not x.startswith("."))
+            for f in sorted(files):
+                _add_candidate(Path(root) / f)
+
+    for rp in raw_paths:
+        target = resolve_workspace_path(str(rp))
+        if not target or not target.exists():
+            continue
+        if target.is_dir():
+            _walk_dir(target)
+        else:
+            _add_candidate(target)
+
+    if raw_dir:
+        target_dir = resolve_workspace_path(str(raw_dir))
+        if target_dir and target_dir.exists():
+            if target_dir.is_dir():
+                _walk_dir(target_dir)
+            else:
+                _add_candidate(target_dir)
+
+    if not collected:
+        return "No readable text files matched the specified paths/directory."
+
+    sections: list[str] = []
+    total_chars = 0
+    omitted_files: list[str] = []
+
+    for idx, fpath in enumerate(collected):
+        rel = fpath.relative_to(ws)
+        lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+        total_lines = len(lines)
+        shown_lines = lines[:max_lines_per_file]
+        body = _format_with_line_numbers(shown_lines, start_line=1)
+        if total_lines > max_lines_per_file:
+            body += f"\n...(truncated after {max_lines_per_file} of {total_lines} lines)..."
+
+        block = f"=== FILE: ~/{rel} (total {total_lines} lines) ===\n{body}"
+        if total_chars + len(block) > MAX_BATCH_READ_CHARS and sections:
+            omitted_files = [f"~/{p.relative_to(ws)}" for p in collected[idx:]]
+            break
+
+        sections.append(block)
+        total_chars += len(block)
+
+    if omitted_files:
+        sections.append(
+            f"=== OMITTED FILES (reached {MAX_BATCH_READ_CHARS:,} chars limit) ===\n"
+            + "\n".join(f"- {p}" for p in omitted_files)
+        )
+
+    return "\n\n".join(sections)
 
 
 def _tool_write_file(args: dict[str, Any]) -> str:
@@ -102,7 +238,116 @@ def _tool_write_file(args: dict[str, Any]) -> str:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     rel = target.relative_to(get_workspace_dir().resolve())
-    return f"Successfully wrote {len(content)} chars to ~/{rel}."
+    line_cnt = len(content.splitlines())
+    return f"Successfully wrote {len(content)} chars ({line_cnt} lines) to ~/{rel}."
+
+
+def _tool_write_files(args: dict[str, Any]) -> str:
+    """複数ファイルを一括で新規作成・上書きする"""
+    files_list = args.get("files") or []
+    if not isinstance(files_list, list) or not files_list:
+        return "Error: 'files' must be a non-empty list of {'path': ..., 'content': ...}."
+
+    results: list[str] = []
+    for item in files_list:
+        if not isinstance(item, dict):
+            continue
+        results.append(_tool_write_file(item))
+    return "\n".join(results) if results else "Error: No valid file entries provided."
+
+
+def _tool_edit_lines(args: dict[str, Any]) -> str:
+    """
+    行番号範囲 (start_line 〜 end_line, 1始まり・両端含む) を指定して改行付き文字列に一括置換する。
+    同一ファイル内の複数箇所編集は行番号の降順（下から上）で自動適用し、行ズレを防止する。
+    """
+    raw_edits = args.get("edits")
+    if isinstance(raw_edits, list) and raw_edits:
+        edit_items = raw_edits
+    elif "path" in args and "start_line" in args:
+        edit_items = [args]
+    else:
+        return "Error: Provide 'edits' list or ('path', 'start_line', 'end_line', 'new_text')."
+
+    ws = get_workspace_dir().resolve()
+    grouped: dict[Path, list[tuple[int, int, str]]] = {}
+    errors: list[str] = []
+
+    for idx, item in enumerate(edit_items, 1):
+        if not isinstance(item, dict):
+            continue
+        raw_path = str(item.get("path", "")).strip()
+        target = resolve_workspace_path(raw_path)
+        if not target or not target.exists() or target.is_dir():
+            errors.append(f"Edit #{idx}: File '{raw_path}' not found.")
+            continue
+        try:
+            s_line = int(item["start_line"])
+            e_line = int(item.get("end_line", s_line))
+        except Exception:
+            errors.append(f"Edit #{idx} ({raw_path}): 'start_line'/'end_line' must be integers.")
+            continue
+
+        if s_line < 1 or e_line < s_line:
+            errors.append(f"Edit #{idx} ({raw_path}): Invalid range {s_line}-{e_line} (must be 1 <= start_line <= end_line).")
+            continue
+
+        new_text = str(item.get("new_text", item.get("new_content", "")))
+        grouped.setdefault(target, []).append((s_line, e_line, new_text))
+
+    if errors:
+        return "Error(s) in edit_lines:\n" + "\n".join(errors)
+
+    reports: list[str] = []
+
+    for target, ops in grouped.items():
+        rel = target.relative_to(ws)
+        orig_text = target.read_text(encoding="utf-8", errors="replace")
+        lines = orig_text.splitlines()
+        total = len(lines)
+
+        # 下の行（start_lineの降順）からソート
+        ops_sorted = sorted(ops, key=lambda x: (x[0], x[1]), reverse=True)
+
+        # 範囲妥当性＆重複チェック
+        file_err = False
+        for i, (s_line, e_line, _) in enumerate(ops_sorted):
+            if s_line > total + 1 or e_line > max(total, s_line):
+                reports.append(f"Error (~/{rel}): Range {s_line}-{e_line} exceeds file length ({total} lines).")
+                file_err = True
+                break
+            if i > 0:
+                prev_s, prev_e, _ = ops_sorted[i - 1]
+                if e_line >= prev_s:
+                    reports.append(
+                        f"Error (~/{rel}): Overlapping line ranges {s_line}-{e_line} and {prev_s}-{prev_e}."
+                    )
+                    file_err = True
+                    break
+        if file_err:
+            continue
+
+        # 降順で置換適用
+        for s_line, e_line, new_text in ops_sorted:
+            replacement_lines = new_text.splitlines() if new_text != "" else []
+            lines[s_line - 1 : e_line] = replacement_lines
+
+        new_full_text = "\n".join(lines) + ("\n" if lines else "")
+        target.write_text(new_full_text, encoding="utf-8")
+
+        # 編集後のプレビュー（最初の編集箇所の周辺）を生成
+        min_s = min(op[0] for op in ops_sorted)
+        max_e = max(op[1] for op in ops_sorted)
+        preview_start = max(1, min_s - 2)
+        preview_end = min(len(lines), max_e + 5)
+        preview_body = _format_with_line_numbers(lines[preview_start - 1 : preview_end], start_line=preview_start)
+
+        reports.append(
+            f"Updated ~/{rel} ({len(ops_sorted)} edit(s) applied, now {len(lines)} lines). "
+            f"Preview (lines {preview_start}-{preview_end}):\n{preview_body}"
+        )
+
+    return "\n\n".join(reports)
 
 
 def _tool_replace_in_file(args: dict[str, Any]) -> str:
@@ -115,10 +360,64 @@ def _tool_replace_in_file(args: dict[str, Any]) -> str:
 
     text = target.read_text(encoding="utf-8")
     if old_text not in text:
-        return f"Error: 'old_text' not found in {raw_path}."
+        return f"Error: 'old_text' not found in {raw_path}. Use 'read_file' and 'edit_lines' with line numbers instead."
     target.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
     rel = target.relative_to(get_workspace_dir().resolve())
     return f"Successfully updated ~/{rel}."
+
+
+def _tool_search_files(args: dict[str, Any]) -> str:
+    """IGNORE_DIRS・バイナリを除外し、行番号付きでキーワード／正規表現を横断検索する"""
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return "Error: Empty 'query'."
+
+    raw_dir = str(args.get("directory", "~/"))
+    target_dir = resolve_workspace_path(raw_dir)
+    if not target_dir or not target_dir.exists():
+        return f"Error: Directory '{raw_dir}' does not exist."
+
+    raw_exts = args.get("extensions")
+    allowed_exts: set[str] | None = None
+    if raw_exts:
+        if isinstance(raw_exts, str):
+            raw_exts = [e.strip() for e in raw_exts.split(",") if e.strip()]
+        allowed_exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in raw_exts}
+
+    try:
+        pattern = re.compile(query, re.IGNORECASE)
+    except re.error:
+        pattern = re.compile(re.escape(query), re.IGNORECASE)
+
+    ws = get_workspace_dir().resolve()
+    matches: list[str] = []
+    match_count = 0
+
+    for root, dirs, files in os.walk(target_dir):
+        dirs[:] = sorted(d for d in dirs if d not in IGNORE_DIRS and not d.startswith("."))
+        for fname in sorted(files):
+            fpath = Path(root) / fname
+            if not _is_readable_text_file(fpath, allowed_exts):
+                continue
+            lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+            hit_lines: list[str] = []
+            for idx, line in enumerate(lines, 1):
+                if pattern.search(line):
+                    hit_lines.append(f"{idx:>4} | {line}")
+                    match_count += 1
+                    if len(hit_lines) >= 30:
+                        hit_lines.append("  ...(more matches in this file)...")
+                        break
+            if hit_lines:
+                rel = fpath.relative_to(ws)
+                matches.append(f"=== ~/{rel} ===\n" + "\n".join(hit_lines))
+            if match_count >= 200:
+                break
+        if match_count >= 200:
+            matches.append("...(search limit of 200 matches reached)...")
+            break
+
+    return "\n\n".join(matches) if matches else f"No matches found for '{query}'."
 
 
 def _tool_run_command(args: dict[str, Any]) -> str:
@@ -167,13 +466,18 @@ def _tool_export_zip(args: dict[str, Any]) -> str:
 TOOL_DISPATCH = {
     "list_files": _tool_list_files,
     "read_file": _tool_read_file,
+    "read_files": _tool_read_files,
     "write_file": _tool_write_file,
+    "write_files": _tool_write_files,
+    "edit_lines": _tool_edit_lines,
     "replace_in_file": _tool_replace_in_file,
+    "search_files": _tool_search_files,
     "run_command": _tool_run_command,
     "web_search": _tool_web_search,
     "fetch_url": _tool_fetch_url,
     "export_zip": _tool_export_zip,
 }
+
 
 
 def parse_tool_args(raw_args: Any) -> dict[str, Any]:
@@ -198,8 +502,8 @@ async def execute_tool(name: str, raw_args: Any) -> str:
     if not fn:
         return f"Error: Unknown tool '{name}'."
 
-    if name in ("write_file", "replace_in_file"):
+    if name in ("write_file", "write_files", "edit_lines", "replace_in_file"):
         async with _file_write_lock:
             return await asyncio.to_thread(fn, args)
-        
+
     return await asyncio.to_thread(fn, args)

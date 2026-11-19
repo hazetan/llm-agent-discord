@@ -16,7 +16,28 @@ from core.config import (
 
 CONTAINER_NAME = "sier_agent_sandbox"
 CONTAINER_HOME = "/root"
-IGNORE_DIRS = {".git", "__pycache__", ".venv", "venv", ".pytest_cache", "node_modules"}
+IGNORE_DIRS = {
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".pytest_cache",
+    "node_modules",
+    "build",
+    "dist",
+    "target",
+    "out",
+    ".next",
+    ".nuxt",
+    ".cache",
+    "coverage",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".eggs",
+    "bin",
+    "obj",
+}
 
 current_worker_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("current_worker", default="main")
 

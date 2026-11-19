@@ -1,6 +1,6 @@
 from typing import Any
 
-from core.config import get_max_steps_per_phase, get_sandbox_env_hint
+from core.config import get_max_steps_per_phase, get_sandbox_env_hint, get_server_ctx_size
 from core.llm_client import chat_step
 from core.logger import RoleLogger
 from core.telemetry import telemetry
@@ -35,6 +35,7 @@ async def run_role_phase(
     telemetry.start_role(role)
 
     steps_limit = max_steps or get_max_steps_per_phase()
+    max_tool_output_chars = max(6000, min(150_000, get_server_ctx_size() * 2))
     logger = RoleLogger(role)
     tools = get_tools_for_role(ROLE_ALLOWED_TOOLS[role])
 
@@ -104,7 +105,7 @@ async def run_role_phase(
                     "role": "tool",
                     "tool_call_id": call.get("id", f"call_{step}"),
                     "name": fn_name,
-                    "content": output[:6000],
+                    "content": output[:max_tool_output_chars],
                 })
 
                 if fn_name == "complete_phase":
