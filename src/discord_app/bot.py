@@ -4,7 +4,7 @@ import re
 import discord
 
 from agents.auditor_agent import continuous_auditor_loop
-from agents.dev_pipeline import start_parallel_dev_workers
+from agents.dev_pipeline import continuous_dev_pipeline_loop
 from agents.pm_agent import handle_client_message
 from core.config import get_monitored_channel_ids
 from core.nas_server import nas_server
@@ -70,8 +70,8 @@ async def on_ready() -> None:
         _background_tasks.append(
             asyncio.create_task(bot.status_monitor.periodic_update_loop())
         )
-        _background_tasks.extend(
-            start_parallel_dev_workers(on_phase_complete=on_pipeline_phase_done)
+        _background_tasks.append(
+            asyncio.create_task(continuous_dev_pipeline_loop(on_phase_complete=on_pipeline_phase_done))
         )
         _background_tasks.append(
             asyncio.create_task(continuous_auditor_loop())

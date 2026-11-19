@@ -47,6 +47,7 @@ class RoleLogger:
         tool_args: dict[str, Any] | None = None,
         tool_output: str | None = None,
         latency_sec: float = 0.0,
+        tps: float = 0.0,
     ) -> None:
         compact_args = {}
         if tool_args:
@@ -62,8 +63,9 @@ class RoleLogger:
                 else tool_output
             )
 
+        tps_str = f" | {tps:.1f} tok/s" if tps > 0 else ""
         lines = [
-            f"--- [Step {step} | {now_jst_str()} | {latency_sec:.2f}s] ---",
+            f"--- [Step {step} | {now_jst_str()} | {latency_sec:.2f}s{tps_str}] ---",
         ]
         if thought:
             lines.append(f"Thought : {thought}")

@@ -39,17 +39,29 @@ class BranchEvent:
     result: str
 
 
+ROLE_TARGET_STATUSES: dict[str, tuple[str, ...]] = {
+    "SE": ("TODO",),
+    "PG": ("IMPL", "FIX"),
+    "QA": ("QA",),
+}
+
+
 @dataclass
 class SystemTelemetry:
-    active_workers: dict[str, str] = field(default_factory=dict)  # {worker_id: role}
+    active_roles: set[str] = field(default_factory=set)
     role_ctx_tokens: dict[str, int] = field(default_factory=lambda: {r: 0 for r in ROLES})
-    branches: deque[BranchEvent] = field(default_factory=lambda: deque(maxlen=4))
+    role_tps: dict[str, float] = field(default_factory=lambda: {r: 0.0 for r in ROLES})
+    role_branches: dict[str, deque[BranchEvent]] = field(
+        default_factory=lambda: {r: deque(maxlen=3) for r in ROLES}
+    )
 
+    # log-raw 用の最新ステップ生データ
     raw_role: str = "IDLE"
     raw_model: str = "-"
     raw_step: int = 0
     raw_max_steps: int = 0
     raw_latency: float = 0.0
+    raw_tps: float = 0.0
     raw_thought: str = "(待機中...)"
     raw_tool_name: str = "-"
     raw_tool_args: str = "-"
@@ -57,28 +69,35 @@ class SystemTelemetry:
     on_raw_update: Any = None
 
     @property
-    def active_role(self) -> str:
-        if not self.active_workers:
+    def active_role_label(self) -> str:
+        if not self.active_roles:
             return "IDLE"
-        return ",".join(sorted(self.active_workers.keys()))[:18]
+        return ",".join(sorted(self.active_roles))
 
-    def set_worker_active(self, worker_id: str, role: str, is_active: bool) -> None:
-        if is_active:
-            self.active_workers[worker_id] = role.upper()
-        else:
-            self.active_workers.pop(worker_id, None)
+    def start_role(self, role: str) -> None:
+        r = role.upper()
+        self.active_roles.add(r)
+        if r in self.role_branches:
+            self.role_branches[r].clear()
+
+    def end_role(self, role: str) -> None:
+        self.active_roles.discard(role.upper())
 
     def set_active_role(self, role: str) -> None:
-        if role == "IDLE":
-            self.active_workers.clear()
+        if role.upper() == "IDLE":
+            self.active_roles.clear()
         else:
-            self.active_workers[role] = role.upper()
+            self.start_role(role)
 
-    def update_role_tokens(self, role: str, used_tokens: int) -> None:
+    def update_role_tokens(self, role: str, used_tokens: int, tps: float | None = None) -> None:
+        r = role.upper()
         if used_tokens > 0:
-            self.role_ctx_tokens[role.upper()] = used_tokens
+            self.role_ctx_tokens[r] = used_tokens
+        if tps is not None:
+            self.role_tps[r] = tps
 
     def add_branch_event(self, role: str, tool_name: str, args: dict[str, Any], output: str) -> None:
+        r = role.upper()
         if tool_name == "run_command":
             target = args.get("command", "")
         elif "path" in args:
@@ -89,9 +108,9 @@ class SystemTelemetry:
             target = str(args)[:40]
 
         first_line = output.strip().splitlines()[0] if output.strip() else "(ok)"
-        self.branches.append(
+        self.role_branches.setdefault(r, deque(maxlen=3)).append(
             BranchEvent(
-                role=role.upper(),
+                role=r,
                 action=f"{tool_name}: {target}"[:52],
                 result=first_line[:52],
             )
@@ -108,6 +127,7 @@ class SystemTelemetry:
         tool_name: str = "-",
         tool_args: dict[str, Any] | None = None,
         tool_output: str = "",
+        tps: float = 0.0,
     ) -> None:
         import json
 
@@ -116,6 +136,7 @@ class SystemTelemetry:
         self.raw_step = step
         self.raw_max_steps = max_steps
         self.raw_latency = latency
+        self.raw_tps = tps
         self.raw_thought = thought or "(思考テキストなし・直接ツール呼び出し)"
         self.raw_tool_name = tool_name
         self.raw_tool_args = json.dumps(tool_args or {}, ensure_ascii=False)
@@ -157,8 +178,8 @@ async def _fetch_ollama_memory() -> dict[str, tuple[float, float]]:
     return result
 
 
-async def _fetch_desktop_metrics() -> dict[str, float] | None:
-    """Ubuntu Server 側のメトリクスエンドポイントから正確な実測値を取得する"""
+async def _fetch_desktop_hw_metrics() -> dict[str, float] | None:
+    """Desktop側の desktop_metrics_server.py からリアルな VRAM / RAM 実測値を取得する"""
     url = get_desktop_metrics_url()
     if not url:
         return None
@@ -214,24 +235,23 @@ def _parse_tasks_from_md() -> list[tuple[str, str]]:
 
 
 async def render_status_box() -> str:
-    """Discord標準のコードブロック枠のみを使い、横幅・上下行数を固定したダッシュボードを生成する"""
+    """稼働中のロール・タスクのみをハイライトし、実測メモリ・速度(tok/s)・CTXを表示するダッシュボード"""
     ps_map = await _fetch_ollama_memory()
-    hw_metrics = await _fetch_desktop_metrics()
+    hw_data = await _fetch_desktop_hw_metrics()
+
+    max_vram = (hw_data.get("vram_total_gb") if hw_data else None) or get_desktop_vram_gb()
+    max_ram = (hw_data.get("ram_total_gb") if hw_data else None) or get_desktop_ram_gb()
     max_ctx = get_server_ctx_size()
     rpi_free = _get_rpi_free_ram_gb()
 
-    if hw_metrics:
-        used_vram = float(hw_metrics.get("vram_used_gb", 0.0))
-        max_vram = float(hw_metrics.get("vram_total_gb") or get_desktop_vram_gb())
-        used_ram = float(hw_metrics.get("ram_used_gb", 0.0))
-        max_ram = float(hw_metrics.get("ram_total_gb") or get_desktop_ram_gb())
-        ollama_real_mem = float(hw_metrics.get("ollama_vram_gb", 0.0)) + float(hw_metrics.get("ollama_ram_gb", 0.0))
+    if hw_data:
+        used_vram = hw_data.get("vram_used_gb", 0.0)
+        used_ram = hw_data.get("ram_used_gb", 0.0)
+        ollama_real_mem = used_vram + hw_data.get("ollama_ram_gb", 0.0)
     else:
-        max_vram = get_desktop_vram_gb()
-        max_ram = get_desktop_ram_gb()
         used_vram = sum(v for v, _ in ps_map.values())
         used_ram = sum(r for _, r in ps_map.values())
-        ollama_real_mem = 0.0
+        ollama_real_mem = used_vram + used_ram
 
     free_vram = max(0.0, max_vram - used_vram)
     free_ram = max(0.0, max_ram - used_ram)
@@ -241,16 +261,18 @@ async def render_status_box() -> str:
     divider = f"{C_GRAY}{'─' * 84}{C_RESET}"
 
     lines: list[str] = [
-        f"{C_GREEN}● SIer MULTI-AGENT MONITOR{C_RESET}  |  Active: {C_CYAN}{telemetry.active_role:<8}{C_RESET}  |  {now_jst_str()}",
+        f"{C_GREEN}● SIer MULTI-AGENT MONITOR{C_RESET}  |  Active: {C_CYAN}{telemetry.active_role_label:<10}{C_RESET}  |  {now_jst_str()}",
         divider,
-        f"{C_BOLD}[HARDWARE & MEMORY]{C_RESET} Ubuntu ({max_vram:.0f}GB VRAM + {max_ram:.0f}GB RAM)  |  RPi4 Free: {rpi_free:.1f}GB",
+        f"{C_BOLD}[HARDWARE & MEMORY]{C_RESET} Desktop ({max_vram:.0f}GB VRAM + {max_ram:.0f}GB RAM)  |  RPi4 Free: {rpi_free:.1f}GB",
         f"  VRAM : [{_make_bar(used_vram / max_vram, 14)}] {used_vram:5.1f} / {max_vram:4.1f} GB ({vram_pct:4.1f}%)  |  Free: {free_vram:5.1f} GB",
         f"  RAM  : [{_make_bar(used_ram / max_ram, 14)}] {used_ram:5.1f} / {max_ram:4.1f} GB ({ram_pct:4.1f}%)  |  Free: {free_ram:5.1f} GB",
         "",
-        f"{C_BOLD}[ROLES: MEMORY & CONTEXT (MAX CTX: {max_ctx:,} tok)]{C_RESET}",
+        f"{C_BOLD}[ROLES: MEMORY, SPEED & CONTEXT (MAX CTX: {max_ctx:,} tok)]{C_RESET}",
     ]
 
     total_sys_mem = max_vram + max_ram
+    total_ps_mem = sum(v + r for v, r in ps_map.values())
+
     for role in ROLES:
         try:
             model = get_model_for_role(role)
@@ -258,34 +280,35 @@ async def render_status_box() -> str:
             model = "none"
 
         v_gb, r_gb = ps_map.get(model, (0.0, 0.0))
-        is_loaded = (v_gb + r_gb) > 0.0
-        if not is_loaded:
+        if v_gb == 0.0 and r_gb == 0.0:
             for loaded_name, mem_pair in ps_map.items():
                 if model.lower() in loaded_name.lower() or loaded_name.lower() in model.lower():
                     v_gb, r_gb = mem_pair
-                    is_loaded = True
                     break
 
-        ps_mem = v_gb + r_gb
-        # ロード中のモデルが1種類のみ、かつ実測値が取れている場合は実プロセス消費量を優先表示
-        if is_loaded and len(ps_map) == 1 and ollama_real_mem > 0:
-            role_mem = max(ps_mem, ollama_real_mem)
+        ps_role_mem = v_gb + r_gb
+        if hw_data and ps_role_mem > 0 and total_ps_mem > 0:
+            role_mem = ollama_real_mem * (ps_role_mem / total_ps_mem)
+        elif hw_data and len(ps_map) == 1 and ps_role_mem > 0:
+            role_mem = ollama_real_mem
         else:
-            role_mem = ps_mem
+            role_mem = ps_role_mem
 
         mem_pct = (role_mem / total_sys_mem) * 100 if total_sys_mem else 0.0
         ctx_tok = telemetry.role_ctx_tokens.get(role, 0)
         ctx_ratio = ctx_tok / max_ctx if max_ctx else 0.0
+        tps_val = telemetry.role_tps.get(role, 0.0)
 
-        is_active = role in telemetry.active_workers.values()
+        is_active = role in telemetry.active_roles
         mark = "▶" if is_active else "•"
         color = C_CYAN if is_active else C_WHITE
-        short_model = model[:14].ljust(14)
+        short_model = model[:11].ljust(11)
 
         row_str = (
-            f"  {mark} {role:<7} ({short_model})  "
-            f"Mem: {role_mem:4.1f}GB ({mem_pct:2.0f}%)  |  "
-            f"CTX: [{_make_bar(ctx_ratio, 8)}] {_format_tok_compact(ctx_tok)} ({ctx_ratio*100:4.1f}%)"
+            f"  {mark} {role:<7} ({short_model}) "
+            f"Mem:{role_mem:4.1f}GB({mem_pct:2.0f}%) | "
+            f"{tps_val:5.1f}t/s | "
+            f"CTX:[{_make_bar(ctx_ratio, 6)}] {ctx_tok:6,d}({ctx_ratio*100:4.1f}%)"
         )
         lines.append(f"{color}{row_str}{C_RESET}")
 
@@ -294,7 +317,14 @@ async def render_status_box() -> str:
 
     tasks = _parse_tasks_from_md()
     task_lines: list[str] = []
-    active_idx = next((i for i, (st, _) in enumerate(tasks) if st != "DONE"), -1)
+
+    active_task_map: dict[int, str] = {}
+    for act_role in telemetry.active_roles:
+        target_statuses = ROLE_TARGET_STATUSES.get(act_role, ())
+        for idx, (st, _) in enumerate(tasks):
+            if st in target_statuses and idx not in active_task_map:
+                active_task_map[idx] = act_role
+                break
 
     for idx, (status, title) in enumerate(tasks):
         if len(task_lines) >= TOTAL_TASK_SECTION_LINES:
@@ -302,10 +332,11 @@ async def render_status_box() -> str:
 
         if status == "DONE":
             task_lines.append(f"{C_GREEN}{_truncate_line(f'  ✔ [DONE] {title}')}{C_RESET}")
-        elif idx == active_idx:
+        elif idx in active_task_map:
+            working_role = active_task_map[idx]
             task_lines.append(f"{C_YELLOW}{_truncate_line(f'  ▶ [{status}] {title}')}{C_RESET}")
 
-            branch_list = list(telemetry.branches)
+            branch_list = list(telemetry.role_branches.get(working_role, []))
             for b_i, b in enumerate(branch_list):
                 if len(task_lines) >= TOTAL_TASK_SECTION_LINES:
                     break
@@ -321,12 +352,10 @@ async def render_status_box() -> str:
     if not task_lines:
         task_lines.append(f"{C_WHITE}  (現在登録されているタスクはありません){C_RESET}")
 
-    # 上下幅（行数）を常に一定に保つための空白パディング行
     while len(task_lines) < TOTAL_TASK_SECTION_LINES:
         task_lines.append(" ")
 
     lines.extend(task_lines)
-
     return "```ansi\n" + "\n".join(lines) + "\n```"
 
 
@@ -355,7 +384,7 @@ def _format_fixed_block(text: str, fixed_lines: int, line_width: int = 74) -> li
 
 def render_raw_log_box() -> str:
     """log-raw チャンネル向けに横幅・上下行数（全27行）を完全固定した生ログBoxを生成する"""
-    divider = f"{C_GRAY}{'─' * 84}{C_RESET}"
+    divider = f"{C_WHITE}{'─' * 84}{C_RESET}"
 
     thought_lines = _format_fixed_block(telemetry.raw_thought, fixed_lines=7)
     args_text = f"Tool : {telemetry.raw_tool_name}\nArgs : {telemetry.raw_tool_args}"
@@ -364,9 +393,10 @@ def render_raw_log_box() -> str:
 
     lines: list[str] = [
         (
-            f"{C_YELLOW}⚡ LIVE RAW STREAM{C_RESET}  |  "
-            f"Role: {C_CYAN}{telemetry.raw_role} ({telemetry.raw_model[:16]}){C_RESET}  |  "
-            f"Step: {telemetry.raw_step}/{telemetry.raw_max_steps} ({telemetry.raw_latency:.1f}s)  |  "
+            f"{C_YELLOW}⚡ LIVE RAW STREAM{C_RESET} | "
+            f"Role: {C_CYAN}{telemetry.raw_role} ({telemetry.raw_model[:16]}){C_RESET} | "
+            f"Step: {telemetry.raw_step}/{telemetry.raw_max_steps} "
+            f"({telemetry.raw_latency:.1f}s, {telemetry.raw_tps:.1f}t/s) | "
             f"{now_jst_str()}"
         ),
         divider,

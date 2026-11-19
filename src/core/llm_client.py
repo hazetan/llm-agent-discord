@@ -9,7 +9,6 @@ import aiohttp
 
 from .config import (
     get_llm_timeout,
-    get_max_concurrent_llm,
     get_model_for_role,
     get_ollama_chat_url,
     get_ollama_keep_alive,
@@ -26,14 +25,7 @@ HIGH_THINKING_DIRECTIVE = (
 )
 
 
-_llm_semaphore: asyncio.Semaphore | None = None
-
-
-def _get_llm_semaphore() -> asyncio.Semaphore:
-    global _llm_semaphore
-    if _llm_semaphore is None:
-        _llm_semaphore = asyncio.Semaphore(get_max_concurrent_llm())
-    return _llm_semaphore
+_llm_lock = asyncio.Lock()
 
 
 def extract_thinking_and_clean(raw_content: str, explicit_thinking: str = "") -> tuple[str, str]:
@@ -149,8 +141,8 @@ async def chat_step(
     role: str,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
-) -> tuple[dict[str, Any], float, str]:
-    """Ollama ネイティブ /api/chat で推論を実行し、Thinking とツール呼び出しを取得する"""
+) -> tuple[dict[str, Any], float, str, float]:
+    """Ollama ネイティブ /api/chat で推論を実行し、Thinking とツール呼び出し・tok/s を取得する"""
     model_name = get_model_for_role(role)
     prepared_msgs = _prepare_messages_for_ollama(messages)
     payload: dict[str, Any] = {
@@ -183,8 +175,10 @@ async def chat_step(
 
     start_t = time.perf_counter()
     timeout = aiohttp.ClientTimeout(total=get_llm_timeout())
+    tps = 0.0
 
-    async with _get_llm_semaphore():
+    async with _llm_lock:
+        req_start_t = time.perf_counter()
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(get_ollama_chat_url(), json=payload) as resp:
                 data = await resp.json()
@@ -192,6 +186,7 @@ async def chat_step(
                 # もしモデルが "high"/"max" 等の文字列レベル指定に非対応で 400 を返した場合、think=True で自動再試行
                 if resp.status == 400 and isinstance(think_setting, str):
                     payload["think"] = True
+                    req_start_t = time.perf_counter()
                     async with session.post(get_ollama_chat_url(), json=payload) as retry_resp:
                         resp = retry_resp
                         data = await retry_resp.json()
@@ -199,13 +194,29 @@ async def chat_step(
                 if resp.status != 200 or "message" not in data:
                     raise RuntimeError(f"Ollama Error ({resp.status}, model={model_name}): {data}")
 
-                # 2. 推論完了後に Ollama からの正確な実測トークン数で上書き更新
+                # 実測トークン数を取得し、0または未返却時は送信ペイロード文字数から概算値を算出
                 prompt_tok = int(data.get("prompt_eval_count") or 0)
                 eval_tok = int(data.get("eval_count") or 0)
-                api_total_tok = prompt_tok + eval_tok
-                telemetry.update_role_tokens(role, max(api_total_tok, est_input_tok))
-
                 msg = data["message"]
+
+                if prompt_tok == 0:
+                    raw_prompt_str = json.dumps(payload["messages"], ensure_ascii=False)
+                    if tools:
+                        raw_prompt_str += json.dumps(tools, ensure_ascii=False)
+                    prompt_tok = max(1, len(raw_prompt_str) // 3)
+
+                if eval_tok == 0:
+                    raw_out_str = (msg.get("content") or "") + (msg.get("thinking") or "")
+                    eval_tok = max(1, len(raw_out_str) // 3)
+
+                eval_duration_ns = int(data.get("eval_duration") or 0)
+                if eval_duration_ns > 0:
+                    tps = eval_tok / (eval_duration_ns / 1e9)
+                else:
+                    tps = eval_tok / max(0.001, time.perf_counter() - req_start_t)
+
+                telemetry.update_role_tokens(role, prompt_tok + eval_tok, tps=tps)
+
                 raw_content = msg.get("content") or ""
                 explicit_thinking = msg.get("thinking") or msg.get("reasoning") or ""
 
@@ -225,4 +236,4 @@ async def chat_step(
                     msg["content"] = clean_content
 
     latency = time.perf_counter() - start_t
-    return msg, latency, model_name
+    return msg, latency, model_name, tps

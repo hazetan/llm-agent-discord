@@ -201,5 +201,5 @@ async def execute_tool(name: str, raw_args: Any) -> str:
     if name in ("write_file", "replace_in_file"):
         async with _file_write_lock:
             return await asyncio.to_thread(fn, args)
-
+        
     return await asyncio.to_thread(fn, args)

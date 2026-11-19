@@ -4,7 +4,6 @@ from core.config import get_max_steps_per_phase, get_sandbox_env_hint
 from core.llm_client import chat_step
 from core.logger import RoleLogger
 from core.telemetry import telemetry
-from sandbox.container import current_worker_ctx
 from sandbox.tools import execute_tool, parse_tool_args, read_workspace_doc
 
 from .roles import ROLE_ALLOWED_TOOLS, ROLE_PROMPTS, get_tools_for_role
@@ -31,15 +30,12 @@ async def run_role_phase(
     role: str,
     instruction: str,
     max_steps: int | None = None,
-    worker_id: str | None = None,
 ) -> tuple[str, list[str]]:
     role = role.upper()
-    w_id = (worker_id or role).upper()
-    token = current_worker_ctx.set(w_id)
-    telemetry.set_worker_active(w_id, role, True)
+    telemetry.start_role(role)
 
     steps_limit = max_steps or get_max_steps_per_phase()
-    logger = RoleLogger(w_id)
+    logger = RoleLogger(role)
     tools = get_tools_for_role(ROLE_ALLOWED_TOOLS[role])
 
     system_prompt = ROLE_PROMPTS[role]
@@ -61,7 +57,7 @@ async def run_role_phase(
     try:
         for step in range(1, steps_limit + 1):
             try:
-                response_msg, latency, model_name = await chat_step(role, messages, tools=tools)
+                response_msg, latency, model_name, tps = await chat_step(role, messages, tools=tools)
                 if not header_logged:
                     logger.log_phase_start(model_name, instruction[:200])
                     header_logged = True
@@ -74,8 +70,8 @@ async def run_role_phase(
             messages.append(response_msg)
 
             if not tool_calls:
-                logger.log_step(step, thought, latency_sec=latency)
-                telemetry.record_raw_step(role, model_name, step, steps_limit, latency, thought)
+                logger.log_step(step, thought, latency_sec=latency, tps=tps)
+                telemetry.record_raw_step(role, model_name, step, steps_limit, latency, thought, tps=tps)
                 if telemetry.on_raw_update:
                     await telemetry.on_raw_update()
 
@@ -92,11 +88,11 @@ async def run_role_phase(
                 parsed_args = parse_tool_args(raw_args)
 
                 output = await execute_tool(fn_name, parsed_args)
-                logger.log_step(step, thought, fn_name, parsed_args, output, latency)
-                telemetry.add_branch_event(w_id, fn_name, parsed_args, output)
+                logger.log_step(step, thought, fn_name, parsed_args, output, latency, tps=tps)
+                telemetry.add_branch_event(role, fn_name, parsed_args, output)
 
                 telemetry.record_raw_step(
-                    w_id, model_name, step, steps_limit, latency, thought, fn_name, parsed_args, output
+                    role, model_name, step, steps_limit, latency, thought, fn_name, parsed_args, output, tps=tps
                 )
                 if telemetry.on_raw_update:
                     await telemetry.on_raw_update()
@@ -121,5 +117,4 @@ async def run_role_phase(
 
         return final_summary, created_zips
     finally:
-        telemetry.set_worker_active(w_id, role, False)
-        current_worker_ctx.reset(token)
+        telemetry.end_role(role)
