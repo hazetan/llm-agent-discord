@@ -12,6 +12,8 @@ from .config import (
     get_desktop_metrics_url,
     get_desktop_ram_gb,
     get_desktop_vram_gb,
+    get_heavy_ctx_size,
+    get_heavy_model_for_role,
     get_model_for_role,
     get_ollama_ps_url,
     get_server_ctx_size,
@@ -49,6 +51,7 @@ ROLE_TARGET_STATUSES: dict[str, tuple[str, ...]] = {
 @dataclass
 class SystemTelemetry:
     active_roles: set[str] = field(default_factory=set)
+    heavy_active_roles: set[str] = field(default_factory=set)
     role_ctx_tokens: dict[str, int] = field(default_factory=lambda: {r: 0 for r in ROLES})
     role_tps: dict[str, float] = field(default_factory=lambda: {r: 0.0 for r in ROLES})
     role_branches: dict[str, deque[BranchEvent]] = field(
@@ -72,7 +75,18 @@ class SystemTelemetry:
     def active_role_label(self) -> str:
         if not self.active_roles:
             return "IDLE"
-        return ",".join(sorted(self.active_roles))
+        labels = [
+            f"{r}:HEAVY" if r in self.heavy_active_roles else r
+            for r in sorted(self.active_roles)
+        ]
+        return ",".join(labels)
+
+    def set_heavy_mode(self, role: str, active: bool) -> None:
+        r = role.upper()
+        if active:
+            self.heavy_active_roles.add(r)
+        else:
+            self.heavy_active_roles.discard(r)
 
     def start_role(self, role: str) -> None:
         r = role.upper()
@@ -270,7 +284,7 @@ async def render_status_box() -> str:
 
     max_vram = (hw_data.get("vram_total_gb") if hw_data else None) or get_desktop_vram_gb() or 0.0
     max_ram = (hw_data.get("ram_total_gb") if hw_data else None) or get_desktop_ram_gb() or 0.0
-    max_ctx = get_server_ctx_size() or 0
+    get_server_ctx_size() or 0
     rpi_free = _get_rpi_free_ram_gb()
 
     if hw_data:
@@ -288,7 +302,13 @@ async def render_status_box() -> str:
     ram_ratio = (used_ram / max_ram) if max_ram > 0 else 0.0
     vram_pct = vram_ratio * 100
     ram_pct = ram_ratio * 100
-    max_ctx_label = f"{max_ctx:,} tok" if max_ctx > 0 else "N/A"
+    light_ctx = get_server_ctx_size() or 0
+    heavy_ctx = get_heavy_ctx_size() or light_ctx
+    ctx_header = (
+        f"LIGHT:{light_ctx:,} / HEAVY:{heavy_ctx:,} tok"
+        if heavy_ctx != light_ctx and heavy_ctx > 0
+        else (f"{light_ctx:,} tok" if light_ctx > 0 else "N/A")
+    )
 
     divider = f"{C_GRAY}{'─' * 80}{C_RESET}"
 
@@ -299,17 +319,20 @@ async def render_status_box() -> str:
         f"  VRAM : [{_make_bar(vram_ratio, 14)}] {used_vram:5.1f} / {max_vram:4.1f} GB ({vram_pct:4.1f}%)  |  Free: {free_vram:5.1f} GB",
         f"  RAM  : [{_make_bar(ram_ratio, 14)}] {used_ram:5.1f} / {max_ram:4.1f} GB ({ram_pct:4.1f}%)  |  Free: {free_ram:5.1f} GB",
         "",
-        f"{C_BOLD}[ROLES: MEMORY, SPEED & CONTEXT (MAX CTX: {max_ctx_label})]{C_RESET}",
+        f"{C_BOLD}[ROLES: MEMORY, SPEED & CONTEXT (MAX CTX: {ctx_header})]{C_RESET}",
     ]
 
     total_sys_mem = max_vram + max_ram
     total_ps_mem = sum(v + r for v, r in ps_map.values())
 
     for role in ROLES:
+        is_heavy = role in telemetry.heavy_active_roles
         try:
-            model = get_model_for_role(role)
+            model = get_heavy_model_for_role(role) if is_heavy else get_model_for_role(role)
         except Exception:
             model = "none"
+
+        role_max_ctx = heavy_ctx if is_heavy else light_ctx
 
         v_gb, r_gb = ps_map.get(model, (0.0, 0.0))
         if v_gb == 0.0 and r_gb == 0.0:
@@ -328,19 +351,19 @@ async def render_status_box() -> str:
 
         mem_pct = (role_mem / total_sys_mem) * 100 if total_sys_mem > 0 else 0.0
         ctx_tok = telemetry.role_ctx_tokens.get(role, 0)
-        ctx_ratio = (ctx_tok / max_ctx) if max_ctx > 0 else 0.0
+        ctx_ratio = (ctx_tok / role_max_ctx) if role_max_ctx > 0 else 0.0
         tps_val = telemetry.role_tps.get(role, 0.0)
 
         is_active = role in telemetry.active_roles
-        mark = "▶" if is_active else "•"
-        color = C_CYAN if is_active else C_WHITE
+        mark = "★" if is_heavy else ("▶" if is_active else "•")
+        color = C_YELLOW if is_heavy else (C_CYAN if is_active else C_WHITE)
         short_model = model[:11].ljust(11)
 
         row_str = (
             f"  {mark} {role:<7} ({short_model}) "
             f"Mem:{role_mem:4.1f}GB({mem_pct:2.0f}%) | "
             f"{tps_val:5.1f}t/s | "
-            f"CTX:[{_make_bar(ctx_ratio, 6)}] {_format_tok_compact(ctx_tok)}({ctx_ratio*100:4.1f}%)"
+            f"CTX:[{_make_bar(ctx_ratio, 6)}] {_format_tok_compact(ctx_tok)}({min(999.9, ctx_ratio*100):4.1f}%)"
         )
         lines.append(f"{color}{row_str}{C_RESET}")
 

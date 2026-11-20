@@ -444,13 +444,16 @@ async def generate_heavy_brain(
     start_t = time.perf_counter()
     total_sem, bg_sem = _get_llm_semaphores()
 
-    system_logger.log("LLM_CLIENT", f"[{role}:HEAVY] Acquiring exclusive semaphores for {model_name}...")
-    async with bg_sem:
-        async with total_sem:
-            system_logger.log("LLM_CLIENT", f"[{role}:HEAVY] Exclusive lock acquired. Streaming {model_name}...")
-            msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _execute_ollama_stream(
-                role, model_name, payload, est_input_tok
-            )
+    telemetry.set_heavy_mode(role, True)
+    try:
+        async with bg_sem:
+            async with total_sem:
+                system_logger.log("LLM_CLIENT", f"[{role}:HEAVY] Exclusive lock acquired. Streaming {model_name}...")
+                msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _execute_ollama_stream(
+                    role, model_name, payload, est_input_tok
+                )
+    finally:
+        telemetry.set_heavy_mode(role, False)
 
     if prompt_tok == 0:
         prompt_tok = est_input_tok
