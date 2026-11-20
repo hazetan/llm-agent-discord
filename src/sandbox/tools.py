@@ -8,7 +8,7 @@ from typing import Any
 
 from ddgs import DDGS
 
-from core.config import get_workspace_dir
+from core.config import get_io_chunk_bytes, get_max_ctx_chars_budget, get_workspace_dir
 
 from .container import (
     IGNORE_DIRS,
@@ -49,12 +49,8 @@ SKIP_EXTENSIONS = {
 }
 
 
-MAX_BATCH_READ_CHARS = 150_000
-MAX_SINGLE_FILE_BYTES = 512 * 1024
-
-
 def _is_readable_text_file(path: Path, allowed_exts: set[str] | None = None) -> bool:
-    """バイナリ・巨大ファイル・対象外拡張子を除外する"""
+    """バイナリ・対象外拡張子のみを除外し、巨大テキストファイルもエラーにせず通す"""
     if not path.is_file():
         return False
     ext = path.suffix.lower()
@@ -63,8 +59,6 @@ def _is_readable_text_file(path: Path, allowed_exts: set[str] | None = None) -> 
     if ext in SKIP_EXTENSIONS:
         return False
     try:
-        if path.stat().st_size > MAX_SINGLE_FILE_BYTES:
-            return False
         with path.open("rb") as f:
             chunk = f.read(512)
             if b"\x00" in chunk:
@@ -72,6 +66,42 @@ def _is_readable_text_file(path: Path, allowed_exts: set[str] | None = None) -> 
     except Exception:
         return False
     return True
+
+
+def _stream_read_lines(
+    path: Path,
+    start_line: int = 1,
+    end_line: int | None = None,
+    max_chars: int | None = None,
+) -> tuple[list[str], int, bool]:
+    """
+    粒度可変のバッファサイズ (IO_CHUNK_BYTES) でファイルをストリーミング走査し、
+    指定行範囲 (start_line〜end_line) かつ文字数予算内の行リスト・総行数・予算到達有無を返す。
+    """
+    buf_size = get_io_chunk_bytes()
+    char_limit = max_chars or int(get_max_ctx_chars_budget() * 0.7)
+
+    collected: list[str] = []
+    total_lines = 0
+    acc_chars = 0
+    budget_reached = False
+
+    with path.open("r", encoding="utf-8", errors="replace", buffering=buf_size) as f:
+        for idx, raw_line in enumerate(f, start=1):
+            total_lines = idx
+            if idx < start_line:
+                continue
+            if end_line is not None and idx > end_line:
+                continue
+            if not budget_reached:
+                line = raw_line.rstrip("\r\n")
+                if acc_chars + len(line) + 12 > char_limit and collected:
+                    budget_reached = True
+                else:
+                    collected.append(line)
+                    acc_chars += len(line) + 12
+
+    return collected, total_lines, budget_reached
 
 
 def _format_with_line_numbers(lines: list[str], start_line: int = 1) -> str:
@@ -125,27 +155,30 @@ def _tool_read_file(args: dict[str, Any]) -> str:
     if target.is_dir():
         return f"Error: '{raw_path}' is a directory. Use 'read_files' or 'list_files' instead."
 
-    lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
-    total = len(lines)
     start_line = max(1, int(args.get("start_line", 1)))
-    max_lines = int(args.get("max_lines", 500))
-    end_line = int(args.get("end_line", start_line + max_lines - 1))
-    end_line = min(total, max(start_line, end_line))
+    max_lines = int(args.get("max_lines", 2000))
+    req_end_line = int(args.get("end_line", start_line + max_lines - 1))
+    char_budget = int(get_max_ctx_chars_budget() * 0.7)
 
+    sliced, total, budget_hit = _stream_read_lines(
+        target, start_line=start_line, end_line=req_end_line, max_chars=char_budget
+    )
     rel = target.relative_to(get_workspace_dir().resolve())
     if total == 0:
         return f"=== FILE: ~/{rel} (0 lines) ===\n(Empty file)"
 
-    sliced = lines[start_line - 1 : end_line]
-    header = f"=== FILE: ~/{rel} (lines {start_line}-{end_line} of {total}) ==="
+    actual_end = start_line + len(sliced) - 1 if sliced else start_line
+    header = f"=== FILE: ~/{rel} (lines {start_line}-{actual_end} of {total}) ==="
     body = _format_with_line_numbers(sliced, start_line=start_line)
-    if end_line < total:
-        body += f"\n...({total - end_line} more lines not shown)..."
+    if actual_end < total:
+        reason = "256k context safety budget reached" if budget_hit else f"{total - actual_end} more lines"
+        body += f"\n...({reason}; call read_file with start_line={actual_end + 1} to read further)..."
     return f"{header}\n{body}"
 
 
+
 def _tool_read_files(args: dict[str, Any]) -> str:
-    """複数ファイルまたはディレクトリ配下のファイルを区切り文字＋左側行番号付きで一括閲覧する"""
+    """複数ファイルまたはディレクトリ配下を粒度可変ストリーミング＋行番号付きで一括閲覧する"""
     ws = get_workspace_dir().resolve()
     raw_paths = args.get("paths") or []
     if isinstance(raw_paths, str):
@@ -162,7 +195,8 @@ def _tool_read_files(args: dict[str, Any]) -> str:
             raw_exts = [e.strip() for e in raw_exts.split(",") if e.strip()]
         allowed_exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in raw_exts}
 
-    max_lines_per_file = int(args.get("max_lines_per_file", 500))
+    max_lines_per_file = int(args.get("max_lines_per_file", 1000))
+    batch_char_budget = int(get_max_ctx_chars_budget() * 0.7)
     collected: list[Path] = []
     seen: set[Path] = set()
 
@@ -203,25 +237,33 @@ def _tool_read_files(args: dict[str, Any]) -> str:
     omitted_files: list[str] = []
 
     for idx, fpath in enumerate(collected):
-        rel = fpath.relative_to(ws)
-        lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
-        total_lines = len(lines)
-        shown_lines = lines[:max_lines_per_file]
-        body = _format_with_line_numbers(shown_lines, start_line=1)
-        if total_lines > max_lines_per_file:
-            body += f"\n...(truncated after {max_lines_per_file} of {total_lines} lines)..."
-
-        block = f"=== FILE: ~/{rel} (total {total_lines} lines) ===\n{body}"
-        if total_chars + len(block) > MAX_BATCH_READ_CHARS and sections:
+        remaining_budget = max(4000, batch_char_budget - total_chars)
+        if total_chars >= batch_char_budget and sections:
             omitted_files = [f"~/{p.relative_to(ws)}" for p in collected[idx:]]
             break
 
+        rel = fpath.relative_to(ws)
+        shown_lines, total_lines, budget_hit = _stream_read_lines(
+            fpath, start_line=1, end_line=max_lines_per_file, max_chars=remaining_budget
+        )
+        body = _format_with_line_numbers(shown_lines, start_line=1)
+        if len(shown_lines) < total_lines:
+            body += (
+                f"\n...(truncated after {len(shown_lines)} of {total_lines} lines; "
+                f"use read_file with start_line={len(shown_lines) + 1} if needed)..."
+            )
+
+        block = f"=== FILE: ~/{rel} (total {total_lines} lines) ===\n{body}"
         sections.append(block)
         total_chars += len(block)
 
+        if budget_hit and idx + 1 < len(collected):
+            omitted_files = [f"~/{p.relative_to(ws)}" for p in collected[idx + 1 :]]
+            break
+
     if omitted_files:
         sections.append(
-            f"=== OMITTED FILES (reached {MAX_BATCH_READ_CHARS:,} chars limit) ===\n"
+            f"=== OMITTED FILES (reached 256k context safety budget of {batch_char_budget:,} chars) ===\n"
             + "\n".join(f"- {p}" for p in omitted_files)
         )
 
@@ -367,7 +409,7 @@ def _tool_replace_in_file(args: dict[str, Any]) -> str:
 
 
 def _tool_search_files(args: dict[str, Any]) -> str:
-    """IGNORE_DIRS・バイナリを除外し、行番号付きでキーワード／正規表現を横断検索する"""
+    """IGNORE_DIRS・バイナリを除外し、ストリーミング走査でキーワード／正規表現を横断検索する"""
     query = str(args.get("query", "")).strip()
     if not query:
         return "Error: Empty 'query'."
@@ -390,6 +432,7 @@ def _tool_search_files(args: dict[str, Any]) -> str:
         pattern = re.compile(re.escape(query), re.IGNORECASE)
 
     ws = get_workspace_dir().resolve()
+    buf_size = get_io_chunk_bytes()
     matches: list[str] = []
     match_count = 0
 
@@ -399,15 +442,19 @@ def _tool_search_files(args: dict[str, Any]) -> str:
             fpath = Path(root) / fname
             if not _is_readable_text_file(fpath, allowed_exts):
                 continue
-            lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
             hit_lines: list[str] = []
-            for idx, line in enumerate(lines, 1):
-                if pattern.search(line):
-                    hit_lines.append(f"{idx:>4} | {line}")
-                    match_count += 1
-                    if len(hit_lines) >= 30:
-                        hit_lines.append("  ...(more matches in this file)...")
-                        break
+            try:
+                with fpath.open("r", encoding="utf-8", errors="replace", buffering=buf_size) as f:
+                    for idx, raw_line in enumerate(f, 1):
+                        line = raw_line.rstrip("\r\n")
+                        if pattern.search(line):
+                            hit_lines.append(f"{idx:>4} | {line}")
+                            match_count += 1
+                            if len(hit_lines) >= 30:
+                                hit_lines.append("  ...(more matches in this file)...")
+                                break
+            except Exception:
+                continue
             if hit_lines:
                 rel = fpath.relative_to(ws)
                 matches.append(f"=== ~/{rel} ===\n" + "\n".join(hit_lines))

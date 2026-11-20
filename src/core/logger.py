@@ -1,4 +1,5 @@
 import json
+import traceback
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -92,3 +93,33 @@ def read_recent_logs(roles: list[str], max_chars_per_role: int = 4000) -> str:
         tail = text[-max_chars_per_role:] if len(text) > max_chars_per_role else text
         sections.append(f"=== RECENT LOG: {role.upper()} ===\n{tail}")
     return "\n\n".join(sections) if sections else "(No logs recorded yet)"
+
+
+class SystemLogger:
+    """起動ごとにリセットされるシステム全体の挙動ダンプ用ロガー (logs/system_debug.log)"""
+
+    def __init__(self) -> None:
+        self.log_path: Path = get_log_dir() / "system_debug.log"
+
+    def reset(self) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        header = (
+            f"{'=' * 80}\n"
+            f"[{now_jst_str()}] 🚀 SYSTEM DEBUG LOG INITIALIZED (RESET ON STARTUP)\n"
+            f"{'=' * 80}\n"
+        )
+        self.log_path.write_text(header, encoding="utf-8")
+
+    def log(self, component: str, message: str, level: str = "INFO") -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        line = f"[{now_jst_str()}] [{level:<5}] [{component:<14}] {message}\n"
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+
+    def error(self, component: str, message: str, exc: BaseException | None = None) -> None:
+        tb = f"\n{traceback.format_exc().rstrip()}" if exc else ""
+        self.log(component, f"{message}{tb}", level="ERROR")
+
+
+system_logger = SystemLogger()

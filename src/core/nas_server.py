@@ -2,6 +2,7 @@ import base64
 import html
 import mimetypes
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -65,40 +66,43 @@ def ensure_samba_service() -> None:
         print("[NAS] Warning: NAS_PASSWORD is not set in .env. Skipping Samba startup for security.")
         return
 
-    # ホスト側の smbd がポート 445 を掴んでいる場合は停止を試みる
     subprocess.run(["sudo", "-n", "systemctl", "stop", "smbd", "nmbd"], check=False, capture_output=True)
 
     uid = os.getuid()
     gid = os.getgid()
 
     smb_conf = (
-        "[global]\\n"
-        "workgroup = WORKGROUP\\n"
-        "server string = SIer Workspace NAS\\n"
-        "security = user\\n"
-        "map to guest = Never\\n"
-        "ntlm auth = yes\\n"
-        "server min protocol = SMB2\\n"
-        "create mask = 0664\\n"
-        "directory mask = 0775\\n"
-        f"force user = {user}\\n"
-        "force group = nasgroup\\n\\n"
-        "[workspace]\\n"
-        "path = /workspace\\n"
-        "browsable = yes\\n"
-        "writable = yes\\n"
-        "read only = no\\n"
-        f"valid users = {user}\\n"
+        "[global]\n"
+        "workgroup = WORKGROUP\n"
+        "server string = SIer Workspace NAS\n"
+        "security = user\n"
+        "map to guest = Never\n"
+        "ntlm auth = yes\n"
+        "server min protocol = SMB2\n"
+        "create mask = 0664\n"
+        "directory mask = 0775\n"
+        f"force user = {user}\n"
+        "force group = nasgroup\n\n"
+        "[workspace]\n"
+        "path = /workspace\n"
+        "browsable = yes\n"
+        "writable = yes\n"
+        "read only = no\n"
+        f"valid users = {user}\n"
     )
+
+    q_user = shlex.quote(user)
+    q_pass = shlex.quote(password)
+    q_conf = shlex.quote(smb_conf)
 
     setup_script = (
         "apk add --no-cache samba >/dev/null && "
         "mkdir -p /var/lib/samba/private /run/samba && "
         f"addgroup -g {gid} nasgroup 2>/dev/null || true && "
-        f"adduser -D -H -u {uid} -G nasgroup {user} 2>/dev/null || true && "
-        f"printf '%s\\n%s\\n' '{password}' '{password}' | smbpasswd -a -s {user} && "
-        f"smbpasswd -e {user} && "
-        f"printf '{smb_conf}' > /etc/samba/smb.conf && "
+        f"adduser -D -H -u {uid} -G nasgroup {q_user} 2>/dev/null || true && "
+        f"printf '%s\\n%s\\n' {q_pass} {q_pass} | smbpasswd -a -s {q_user} && "
+        f"smbpasswd -e {q_user} && "
+        f"printf '%s' {q_conf} > /etc/samba/smb.conf && "
         "smbd --foreground --no-process-group"
     )
 

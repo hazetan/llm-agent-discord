@@ -1,7 +1,7 @@
-import contextvars
+
 import os
-import shlex
 import subprocess
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -11,6 +11,7 @@ from core.config import (
     get_docker_image,
     get_docker_mem_limit,
     get_exports_dir,
+    get_io_chunk_bytes,
     get_workspace_dir,
 )
 
@@ -38,8 +39,6 @@ IGNORE_DIRS = {
     "bin",
     "obj",
 }
-
-current_worker_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("current_worker", default="main")
 
 
 def resolve_workspace_path(raw_path: str) -> Path | None:
@@ -113,31 +112,78 @@ def ensure_sandbox_container(recreate: bool = False) -> str:
 
 
 def run_in_sandbox(command: str) -> str:
-    """サンドボックスコンテナ内の /root (~/) でコマンドを実行する"""
+    """
+    サンドボックスコンテナ内の /root (~/) でコマンドを実行する。
+    コマンド文字列はチャンク粒度可変の標準入力 (stdin) ストリーミングで渡すため、
+    256kサイズ等の巨大コマンドでも OS の ARG_MAX (128KB) エラーにならない。
+    """
     c_name = ensure_sandbox_container(recreate=False)
     timeout_sec = get_command_timeout()
+    chunk_size = get_io_chunk_bytes()
     uid = os.getuid()
     gid = os.getgid()
 
-    inner_script = f"{command}; EXIT_CODE=$?; chown -R {uid}:{gid} {CONTAINER_HOME} 2>/dev/null; exit $EXIT_CODE"
-    wrapped = f"timeout -k 5 {timeout_sec}s sh -c {shlex.quote(inner_script)}"
+    inner_script = (
+        f"{command}\n"
+        f"EXIT_CODE=$?\n"
+        f"chown -R {uid}:{gid} {CONTAINER_HOME} 2>/dev/null\n"
+        f"exit $EXIT_CODE\n"
+    )
+    script_bytes = inner_script.encode("utf-8", errors="replace")
 
+    proc = subprocess.Popen(
+        [
+            "docker", "exec", "-i",
+            "-w", CONTAINER_HOME,
+            c_name,
+            "timeout", "-k", "5", f"{timeout_sec}s",
+            "sh",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    def _feed_stdin() -> None:
+        if not proc.stdin:
+            return
+        try:
+            view = memoryview(script_bytes)
+            for offset in range(0, len(script_bytes), chunk_size):
+                proc.stdin.write(view[offset : offset + chunk_size])
+                proc.stdin.flush()
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    feeder = threading.Thread(target=_feed_stdin, daemon=True)
+    feeder.start()
+
+    out_chunks: list[bytes] = []
     try:
-        res = subprocess.run(
-            ["docker", "exec", "-w", CONTAINER_HOME, c_name, "sh", "-c", wrapped],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec + 10,
-        )
-        out = (res.stdout + res.stderr).strip()
-        if res.returncode in (124, 137):
-            return f"Error: Command timed out after {timeout_sec}s.\n{out}"
-        if res.returncode != 0:
-            return f"[Exit Code: {res.returncode}]\n{out}"
-        return out or "(Command succeeded with no output)"
+        if proc.stdout:
+            while True:
+                buf = proc.stdout.read(chunk_size)
+                if not buf:
+                    break
+                out_chunks.append(buf)
+        proc.wait(timeout=timeout_sec + 10)
     except subprocess.TimeoutExpired:
+        proc.kill()
         return f"Error: Command timed out after {timeout_sec}s."
+    finally:
+        feeder.join(timeout=2)
+
+    out = b"".join(out_chunks).decode("utf-8", errors="replace").strip()
+    if proc.returncode in (124, 137):
+        return f"Error: Command timed out after {timeout_sec}s.\n{out}"
+    if proc.returncode != 0:
+        return f"[Exit Code: {proc.returncode}]\n{out}"
+    return out or "(Command succeeded with no output)"
 
 
 def export_workspace_zip(sub_path: str = ".") -> Path:

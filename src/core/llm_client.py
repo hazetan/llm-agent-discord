@@ -12,20 +12,32 @@ from .config import (
     get_model_for_role,
     get_ollama_chat_url,
     get_ollama_keep_alive,
+    get_ollama_num_parallel,
     get_ollama_options,
     get_ollama_think,
+    get_stream_granularity_tokens,
     get_think_prompt_boost,
 )
+from .logger import system_logger
 from .telemetry import telemetry
 
-HIGH_THINKING_DIRECTIVE = (
-    "\n\n【最高レベル思考プロセス (Deep Thinking) 指示】\n"
-    "ツールを呼び出す前に、必ず現在の状況・ディレクトリ構造・問題の本質・影響範囲・エッジケースを"
-    "最高レベルの深さで段階的に思考（Thinking）し、論理的な整合性を検証してから行動してください。"
-)
+_total_llm_sem: asyncio.Semaphore | None = None
+_bg_llm_sem: asyncio.Semaphore | None = None
+_configured_parallel: int = 0
 
 
-_llm_lock = asyncio.Lock()
+def _get_llm_semaphores() -> tuple[asyncio.Semaphore, asyncio.Semaphore]:
+    """
+    全体枠 (OLLAMA_NUM_PARALLEL) と バックグラウンド枠 (OLLAMA_NUM_PARALLEL - 1) を返す。
+    並列数2以上のとき、常に1枠をPM用に空けておく。未設定(None)時は1並列。
+    """
+    global _total_llm_sem, _bg_llm_sem, _configured_parallel
+    parallel = get_ollama_num_parallel() or 1
+    if _total_llm_sem is None or _bg_llm_sem is None or parallel != _configured_parallel:
+        _configured_parallel = parallel
+        _total_llm_sem = asyncio.Semaphore(parallel)
+        _bg_llm_sem = asyncio.Semaphore(max(1, parallel - 1))
+    return _total_llm_sem, _bg_llm_sem
 
 
 def extract_thinking_and_clean(raw_content: str, explicit_thinking: str = "") -> tuple[str, str]:
@@ -110,6 +122,13 @@ def extract_fallback_tool_calls(content: str) -> list[dict[str, Any]]:
     return calls
 
 
+HIGH_THINKING_DIRECTIVE = (
+    "\n\n【最高レベル思考プロセス (Deep Thinking) 指示】\n"
+    "ツールを呼び出す前に、必ず現在の状況・ディレクトリ構造・問題の本質・影響範囲・エッジケースを"
+    "最高レベルの深さで段階的に思考（Thinking）し、論理的な整合性を検証してから行動してください。"
+)
+
+
 def _prepare_messages_for_ollama(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Ollama /api/chat 向けにメッセージ配列と tool_calls の arguments (dict形式) を正規化する"""
     prepared: list[dict[str, Any]] = []
@@ -137,18 +156,121 @@ def _prepare_messages_for_ollama(messages: list[dict[str, Any]]) -> list[dict[st
     return prepared
 
 
+async def _execute_ollama_stream(
+    role: str,
+    model_name: str,
+    payload: dict[str, Any],
+    est_input_tok: int,
+) -> tuple[dict[str, Any], int, int, int, float]:
+    """Ollama /api/chat をストリーミング受信し、指定粒度ごとにテレメトリとデバッグログを更新する"""
+    timeout_sec = get_llm_timeout()
+    timeout = aiohttp.ClientTimeout(total=timeout_sec, sock_read=timeout_sec)
+    granularity = get_stream_granularity_tokens()
+    think_setting = payload.get("think")
+    chat_url = get_ollama_chat_url()
+
+    req_start_t = time.perf_counter()
+    acc_content: list[str] = []
+    acc_thinking: list[str] = []
+    acc_tool_calls: list[dict[str, Any]] = []
+    chunk_count = 0
+    prompt_tok = 0
+    eval_tok = 0
+    eval_duration_ns = 0
+
+    system_logger.log(
+        "LLM_CLIENT",
+        f"[{role}] POST {chat_url} | model={model_name} | est_in_tok={est_input_tok} | think={think_setting} | options={payload.get('options')}",
+    )
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        resp = await session.post(chat_url, json=payload)
+        system_logger.log("LLM_CLIENT", f"[{role}] HTTP status={resp.status} received.")
+
+        if resp.status == 400 and isinstance(think_setting, str):
+            err_body = await resp.text()
+            system_logger.log("LLM_CLIENT", f"[{role}] 400 with think={think_setting} ({err_body[:120]}). Retrying with think=True...", level="WARN")
+            await resp.release()
+            payload["think"] = True
+            req_start_t = time.perf_counter()
+            resp = await session.post(chat_url, json=payload)
+            system_logger.log("LLM_CLIENT", f"[{role}] Retry HTTP status={resp.status} received.")
+
+        async with resp:
+            if resp.status != 200:
+                err_text = await resp.text()
+                system_logger.log("LLM_CLIENT", f"[{role}] Non-200 error body: {err_text}", level="ERROR")
+                raise RuntimeError(f"Ollama Error ({resp.status}, model={model_name}): {err_text}")
+
+            async for raw_line in resp.content:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+
+                if "error" in data:
+                    system_logger.log("LLM_CLIENT", f"[{role}] Stream JSON error: {data['error']}", level="ERROR")
+                    raise RuntimeError(f"Ollama Stream Error ({model_name}): {data['error']}")
+
+                m = data.get("message") or {}
+                c_piece = m.get("content") or ""
+                t_piece = m.get("thinking") or m.get("reasoning") or ""
+                if c_piece:
+                    acc_content.append(c_piece)
+                if t_piece:
+                    acc_thinking.append(t_piece)
+                if m.get("tool_calls"):
+                    acc_tool_calls.extend(m["tool_calls"])
+
+                if c_piece or t_piece:
+                    chunk_count += 1
+                    if chunk_count == 1:
+                        first_tok_sec = time.perf_counter() - req_start_t
+                        system_logger.log("LLM_CLIENT", f"[{role}] First token chunk arrived in {first_tok_sec:.2f}s.")
+                    if chunk_count % granularity == 0:
+                        elapsed = max(0.001, time.perf_counter() - req_start_t)
+                        live_tps = chunk_count / elapsed
+                        telemetry.update_role_tokens(role, est_input_tok + chunk_count, tps=live_tps)
+
+                if data.get("done"):
+                    prompt_tok = int(data.get("prompt_eval_count") or 0)
+                    eval_tok = int(data.get("eval_count") or chunk_count)
+                    eval_duration_ns = int(data.get("eval_duration") or 0)
+                    break
+
+    elapsed_req = max(0.001, time.perf_counter() - req_start_t)
+    system_logger.log(
+        "LLM_CLIENT",
+        f"[{role}] Stream done in {elapsed_req:.2f}s | prompt_tok={prompt_tok} | eval_tok={eval_tok} | tool_calls={len(acc_tool_calls)}",
+    )
+    assembled_msg: dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(acc_content),
+        "thinking": "".join(acc_thinking),
+    }
+    if acc_tool_calls:
+        assembled_msg["tool_calls"] = acc_tool_calls
+
+    return assembled_msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req
+
+
 async def chat_step(
     role: str,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], float, str, float]:
-    """Ollama ネイティブ /api/chat で推論を実行し、Thinking とツール呼び出し・tok/s を取得する"""
+    """
+    PM優先枠付きの並列制御と粒度可変ストリーミングで Ollama /api/chat を実行する。
+    """
     model_name = get_model_for_role(role)
     prepared_msgs = _prepare_messages_for_ollama(messages)
     payload: dict[str, Any] = {
         "model": model_name,
         "messages": prepared_msgs,
-        "stream": False,
+        "stream": True,
     }
 
     think_setting = get_ollama_think()
@@ -166,7 +288,6 @@ async def chat_step(
     if tools:
         payload["tools"] = tools
 
-    # 1. 推論開始直前に入力コンテキスト長（概算）を即座に記録（待機中でも0にならないようにする）
     est_chars = len(json.dumps(prepared_msgs, ensure_ascii=False))
     if tools:
         est_chars += len(json.dumps(tools, ensure_ascii=False))
@@ -174,66 +295,104 @@ async def chat_step(
     telemetry.update_role_tokens(role, est_input_tok)
 
     start_t = time.perf_counter()
-    timeout = aiohttp.ClientTimeout(total=get_llm_timeout())
-    tps = 0.0
+    total_sem, bg_sem = _get_llm_semaphores()
+    is_pm = role.upper() == "PM"
 
-    async with _llm_lock:
-        req_start_t = time.perf_counter()
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(get_ollama_chat_url(), json=payload) as resp:
-                data = await resp.json()
+    async def _run_locked() -> tuple[dict[str, Any], int, int, int, float]:
+        system_logger.log("LLM_CLIENT", f"[{role}] Waiting for total_sem...")
+        async with total_sem:
+            system_logger.log("LLM_CLIENT", f"[{role}] Acquired total_sem. Executing stream...")
+            return await _execute_ollama_stream(role, model_name, payload, est_input_tok)
 
-                # もしモデルが "high"/"max" 等の文字列レベル指定に非対応で 400 を返した場合、think=True で自動再試行
-                if resp.status == 400 and isinstance(think_setting, str):
-                    payload["think"] = True
-                    req_start_t = time.perf_counter()
-                    async with session.post(get_ollama_chat_url(), json=payload) as retry_resp:
-                        resp = retry_resp
-                        data = await retry_resp.json()
+    if is_pm:
+        msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _run_locked()
+    else:
+        system_logger.log("LLM_CLIENT", f"[{role}] Waiting for bg_sem...")
+        async with bg_sem:
+            system_logger.log("LLM_CLIENT", f"[{role}] Acquired bg_sem.")
+            msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _run_locked()
 
-                if resp.status != 200 or "message" not in data:
-                    raise RuntimeError(f"Ollama Error ({resp.status}, model={model_name}): {data}")
+    if prompt_tok == 0:
+        prompt_tok = est_input_tok
 
-                # 実測トークン数を取得し、0または未返却時は送信ペイロード文字数から概算値を算出
-                prompt_tok = int(data.get("prompt_eval_count") or 0)
-                eval_tok = int(data.get("eval_count") or 0)
-                msg = data["message"]
+    raw_content = msg.get("content") or ""
+    explicit_thinking = msg.get("thinking") or ""
+    if eval_tok == 0:
+        eval_tok = max(1, len(raw_content + explicit_thinking) // 3)
 
-                if prompt_tok == 0:
-                    raw_prompt_str = json.dumps(payload["messages"], ensure_ascii=False)
-                    if tools:
-                        raw_prompt_str += json.dumps(tools, ensure_ascii=False)
-                    prompt_tok = max(1, len(raw_prompt_str) // 3)
+    if eval_duration_ns > 0:
+        tps = eval_tok / (eval_duration_ns / 1e9)
+    else:
+        tps = eval_tok / elapsed_req
 
-                if eval_tok == 0:
-                    raw_out_str = (msg.get("content") or "") + (msg.get("thinking") or "")
-                    eval_tok = max(1, len(raw_out_str) // 3)
+    telemetry.update_role_tokens(role, prompt_tok + eval_tok, tps=tps)
 
-                eval_duration_ns = int(data.get("eval_duration") or 0)
-                if eval_duration_ns > 0:
-                    tps = eval_tok / (eval_duration_ns / 1e9)
-                else:
-                    tps = eval_tok / max(0.001, time.perf_counter() - req_start_t)
+    thinking_text, clean_content = extract_thinking_and_clean(raw_content, explicit_thinking)
 
-                telemetry.update_role_tokens(role, prompt_tok + eval_tok, tps=tps)
+    if not msg.get("tool_calls") and clean_content:
+        fb_calls = extract_fallback_tool_calls(clean_content)
+        if fb_calls:
+            system_logger.log("LLM_CLIENT", f"[{role}] Extracted {len(fb_calls)} fallback tool call(s) from text.")
+            msg["tool_calls"] = fb_calls
 
-                raw_content = msg.get("content") or ""
-                explicit_thinking = msg.get("thinking") or msg.get("reasoning") or ""
-
-                thinking_text, clean_content = extract_thinking_and_clean(raw_content, explicit_thinking)
-
-                if not msg.get("tool_calls") and clean_content:
-                    fb_calls = extract_fallback_tool_calls(clean_content)
-                    if fb_calls:
-                        msg["tool_calls"] = fb_calls
-
-                msg["_clean_content"] = clean_content
-                if thinking_text and clean_content:
-                    msg["content"] = f"[Thinking]\n{thinking_text}\n\n[Response]\n{clean_content}"
-                elif thinking_text:
-                    msg["content"] = thinking_text
-                else:
-                    msg["content"] = clean_content
+    msg["_clean_content"] = clean_content
+    if thinking_text and clean_content:
+        msg["content"] = f"[Thinking]\n{thinking_text}\n\n[Response]\n{clean_content}"
+    elif thinking_text:
+        msg["content"] = thinking_text
+    else:
+        msg["content"] = clean_content
 
     latency = time.perf_counter() - start_t
     return msg, latency, model_name, tps
+
+
+async def warmup_models() -> None:
+    """起動時に設定済みモデルを指定options (256k num_ctx等)・keep_aliveでVRAM/RAMへプリロードする"""
+    models: list[str] = []
+    for role in ("PM", "SE", "PG", "QA", "AUDITOR"):
+        try:
+            m = get_model_for_role(role)
+            if m and m not in models:
+                models.append(m)
+        except Exception:
+            continue
+
+    if not models:
+        return
+
+    chat_url = get_ollama_chat_url()
+    options = get_ollama_options()
+    keep_alive = get_ollama_keep_alive()
+    timeout_sec = get_llm_timeout()
+    timeout = aiohttp.ClientTimeout(total=timeout_sec, sock_read=timeout_sec)
+
+    for model_name in models:
+        payload: dict[str, Any] = {
+            "model": model_name,
+            "messages": [],
+            "stream": False,
+        }
+        if options:
+            payload["options"] = options
+        if keep_alive:
+            payload["keep_alive"] = keep_alive
+
+        system_logger.log(
+            "LLM_CLIENT",
+            f"[WARMUP] Preloading model={model_name} into VRAM/RAM (options={options}, keep_alive={keep_alive})...",
+        )
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(chat_url, json=payload) as resp:
+                    body = await resp.text()
+                    if resp.status == 200:
+                        system_logger.log("LLM_CLIENT", f"[WARMUP] Model={model_name} preloaded successfully.")
+                    else:
+                        system_logger.log(
+                            "LLM_CLIENT",
+                            f"[WARMUP] Failed to preload model={model_name} (HTTP {resp.status}): {body[:200]}",
+                            level="WARN",
+                        )
+        except Exception as exc:
+            system_logger.error("LLM_CLIENT", f"[WARMUP] Exception while preloading {model_name}: {exc}", exc)

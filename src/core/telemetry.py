@@ -16,7 +16,7 @@ from .config import (
     get_ollama_ps_url,
     get_server_ctx_size,
 )
-from .logger import now_jst_str
+from .logger import now_jst_str, system_logger
 
 ROLES = ("PM", "SE", "PG", "QA", "AUDITOR")
 LINE_MAX_CHARS = 78
@@ -161,20 +161,25 @@ def _get_rpi_free_ram_gb() -> float:
 async def _fetch_ollama_memory() -> dict[str, tuple[float, float]]:
     """Ollama /api/ps からモデルごとの (VRAM_GB, RAM_GB) を取得する"""
     result: dict[str, tuple[float, float]] = {}
+    ps_url = get_ollama_ps_url()
     timeout = aiohttp.ClientTimeout(total=5)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(get_ollama_ps_url()) as resp:
+            async with session.get(ps_url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    for m in data.get("models", []):
+                    models = data.get("models", [])
+                    for m in models:
                         name = m.get("name", "")
                         total_gb = m.get("size", 0) / (1024**3)
                         vram_gb = m.get("size_vram", 0) / (1024**3)
                         ram_gb = max(0.0, total_gb - vram_gb)
                         result[name] = (vram_gb, ram_gb)
-    except Exception:
-        pass
+                    system_logger.log("TELEMETRY", f"Ollama /api/ps loaded models ({len(models)}): {result}")
+                else:
+                    system_logger.log("TELEMETRY", f"Ollama /api/ps returned HTTP {resp.status}", level="WARN")
+    except Exception as exc:
+        system_logger.log("TELEMETRY", f"Ollama /api/ps fetch failed ({ps_url}): {exc}", level="WARN")
     return result
 
 
@@ -182,17 +187,20 @@ async def _fetch_desktop_hw_metrics() -> dict[str, float] | None:
     """Desktop側の desktop_metrics_server.py からリアルな VRAM / RAM 実測値を取得する"""
     url = get_desktop_metrics_url()
     if not url:
+        system_logger.log("TELEMETRY", "DESKTOP_METRICS_URL is not set in .env (using /api/ps & static config).")
         return None
     timeout = aiohttp.ClientTimeout(total=3)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
-                    return await resp.json()
-    except Exception:
-        pass
+                    data = await resp.json()
+                    system_logger.log("TELEMETRY", f"Desktop HW metrics fetched: {data}")
+                    return data
+                system_logger.log("TELEMETRY", f"Desktop HW metrics HTTP {resp.status} from {url}", level="WARN")
+    except Exception as exc:
+        system_logger.log("TELEMETRY", f"Desktop HW metrics fetch failed ({url}): {exc}", level="WARN")
     return None
-
 
 def _format_tok_compact(tokens: int) -> str:
     if tokens >= 10000:
@@ -212,21 +220,42 @@ def _visual_width(text: str) -> int:
 
 
 
-def _truncate_line(text: str, max_chars: int = LINE_MAX_CHARS) -> str:
-    """改行を除き、指定文字数を超える場合のみ末尾を省略する"""
-    clean = text.replace("\n", " ")
-    if len(clean) > max_chars:
-        return clean[: max_chars - 2] + ".."
-    return clean
+def _truncate_line(text: str, max_width: int = LINE_MAX_CHARS) -> str:
+    """改行を除き、見た目上の横幅（全角2/半角1）で末尾を省略する"""
+    clean = text.replace("\n", " ").replace("\r", "")
+    if _visual_width(clean) <= max_width:
+        return clean
+    out: list[str] = []
+    w = 0
+    limit = max(1, max_width - 2)
+    for ch in clean:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("F", "W", "A") else 1
+        if w + cw > limit:
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out) + ".."
+
+
+def _wrap_ansi_box(lines: list[str], max_len: int = 1990) -> str:
+    """Discord 2000文字上限を超えないよう安全に ```ansi ブロックへ収める"""
+    body = "\n".join(lines)
+    prefix = "```ansi\n"
+    suffix = "\n```"
+    budget = max_len - len(prefix) - len(suffix)
+    if len(body) > budget:
+        body = body[: max(0, budget - 4)] + C_RESET
+    return f"{prefix}{body}{suffix}"
 
 
 def _parse_tasks_from_md() -> list[tuple[str, str]]:
-    """~/TASK.md からコメント行を除外し、箇条書きの (ステータスタグ, タスク本文) を抽出する"""
+    """~/TASK.md からコメント行を除外し、表記揺れを含めて (ステータスタグ, タスク本文) を抽出する"""
     raw = read_workspace_doc("~/TASK.md")
-    # HTMLコメントを除去
     raw = re.sub(r"<!--.*?-->", "", raw, flags=re.DOTALL)
     tasks: list[tuple[str, str]] = []
-    pattern = re.compile(r"^\s*(?:[-*+]|\d+\.)\s*\[(TODO|IMPL|FIX|QA|DONE)\]\s*(.+)")
+    pattern = re.compile(
+        r"^\s*(?:[-*+]|#+|\d+[.)])?\s*(?:\[[ xX]\]\s*)?(?:\*\*|__)?\s*\[(TODO|IMPL|FIX|QA|DONE)\]\s*(?:\*\*|__)?\s*:?\s*(.+)"
+    )
     for line in raw.splitlines():
         m = pattern.match(line)
         if m:
@@ -239,9 +268,9 @@ async def render_status_box() -> str:
     ps_map = await _fetch_ollama_memory()
     hw_data = await _fetch_desktop_hw_metrics()
 
-    max_vram = (hw_data.get("vram_total_gb") if hw_data else None) or get_desktop_vram_gb()
-    max_ram = (hw_data.get("ram_total_gb") if hw_data else None) or get_desktop_ram_gb()
-    max_ctx = get_server_ctx_size()
+    max_vram = (hw_data.get("vram_total_gb") if hw_data else None) or get_desktop_vram_gb() or 0.0
+    max_ram = (hw_data.get("ram_total_gb") if hw_data else None) or get_desktop_ram_gb() or 0.0
+    max_ctx = get_server_ctx_size() or 0
     rpi_free = _get_rpi_free_ram_gb()
 
     if hw_data:
@@ -255,19 +284,22 @@ async def render_status_box() -> str:
 
     free_vram = max(0.0, max_vram - used_vram)
     free_ram = max(0.0, max_ram - used_ram)
-    vram_pct = (used_vram / max_vram) * 100 if max_vram else 0.0
-    ram_pct = (used_ram / max_ram) * 100 if max_ram else 0.0
+    vram_ratio = (used_vram / max_vram) if max_vram > 0 else 0.0
+    ram_ratio = (used_ram / max_ram) if max_ram > 0 else 0.0
+    vram_pct = vram_ratio * 100
+    ram_pct = ram_ratio * 100
+    max_ctx_label = f"{max_ctx:,} tok" if max_ctx > 0 else "N/A"
 
-    divider = f"{C_GRAY}{'─' * 84}{C_RESET}"
+    divider = f"{C_GRAY}{'─' * 80}{C_RESET}"
 
     lines: list[str] = [
-        f"{C_GREEN}● SIer MULTI-AGENT MONITOR{C_RESET}  |  Active: {C_CYAN}{telemetry.active_role_label:<10}{C_RESET}  |  {now_jst_str()}",
+        f"{C_GREEN}● SIer MULTI-AGENT MONITOR{C_RESET}  |  Active: {C_CYAN}{telemetry.active_role_label:<14}{C_RESET}  |  {now_jst_str()}",
         divider,
         f"{C_BOLD}[HARDWARE & MEMORY]{C_RESET} Desktop ({max_vram:.0f}GB VRAM + {max_ram:.0f}GB RAM)  |  RPi4 Free: {rpi_free:.1f}GB",
-        f"  VRAM : [{_make_bar(used_vram / max_vram, 14)}] {used_vram:5.1f} / {max_vram:4.1f} GB ({vram_pct:4.1f}%)  |  Free: {free_vram:5.1f} GB",
-        f"  RAM  : [{_make_bar(used_ram / max_ram, 14)}] {used_ram:5.1f} / {max_ram:4.1f} GB ({ram_pct:4.1f}%)  |  Free: {free_ram:5.1f} GB",
+        f"  VRAM : [{_make_bar(vram_ratio, 14)}] {used_vram:5.1f} / {max_vram:4.1f} GB ({vram_pct:4.1f}%)  |  Free: {free_vram:5.1f} GB",
+        f"  RAM  : [{_make_bar(ram_ratio, 14)}] {used_ram:5.1f} / {max_ram:4.1f} GB ({ram_pct:4.1f}%)  |  Free: {free_ram:5.1f} GB",
         "",
-        f"{C_BOLD}[ROLES: MEMORY, SPEED & CONTEXT (MAX CTX: {max_ctx:,} tok)]{C_RESET}",
+        f"{C_BOLD}[ROLES: MEMORY, SPEED & CONTEXT (MAX CTX: {max_ctx_label})]{C_RESET}",
     ]
 
     total_sys_mem = max_vram + max_ram
@@ -294,9 +326,9 @@ async def render_status_box() -> str:
         else:
             role_mem = ps_role_mem
 
-        mem_pct = (role_mem / total_sys_mem) * 100 if total_sys_mem else 0.0
+        mem_pct = (role_mem / total_sys_mem) * 100 if total_sys_mem > 0 else 0.0
         ctx_tok = telemetry.role_ctx_tokens.get(role, 0)
-        ctx_ratio = ctx_tok / max_ctx if max_ctx else 0.0
+        ctx_ratio = (ctx_tok / max_ctx) if max_ctx > 0 else 0.0
         tps_val = telemetry.role_tps.get(role, 0.0)
 
         is_active = role in telemetry.active_roles
@@ -308,7 +340,7 @@ async def render_status_box() -> str:
             f"  {mark} {role:<7} ({short_model}) "
             f"Mem:{role_mem:4.1f}GB({mem_pct:2.0f}%) | "
             f"{tps_val:5.1f}t/s | "
-            f"CTX:[{_make_bar(ctx_ratio, 6)}] {ctx_tok:6,d}({ctx_ratio*100:4.1f}%)"
+            f"CTX:[{_make_bar(ctx_ratio, 6)}] {_format_tok_compact(ctx_tok)}({ctx_ratio*100:4.1f}%)"
         )
         lines.append(f"{color}{row_str}{C_RESET}")
 
@@ -319,35 +351,48 @@ async def render_status_box() -> str:
     task_lines: list[str] = []
 
     active_task_map: dict[int, str] = {}
-    for act_role in telemetry.active_roles:
+    for act_role in ROLES:
+        if act_role not in telemetry.active_roles:
+            continue
         target_statuses = ROLE_TARGET_STATUSES.get(act_role, ())
         for idx, (st, _) in enumerate(tasks):
             if st in target_statuses and idx not in active_task_map:
                 active_task_map[idx] = act_role
                 break
 
-    for idx, (status, title) in enumerate(tasks):
-        if len(task_lines) >= TOTAL_TASK_SECTION_LINES:
-            break
+    active_indices = [i for i in range(len(tasks)) if i in active_task_map]
+    pending_indices = [i for i, (st, _) in enumerate(tasks) if st != "DONE" and i not in active_task_map]
+    done_indices = [i for i, (st, _) in enumerate(tasks) if st == "DONE"]
 
-        if status == "DONE":
-            task_lines.append(f"{C_GREEN}{_truncate_line(f'  ✔ [DONE] {title}')}{C_RESET}")
-        elif idx in active_task_map:
+    fg_lines: list[str] = []
+    for idx in active_indices + pending_indices:
+        if len(fg_lines) >= TOTAL_TASK_SECTION_LINES:
+            break
+        status, title = tasks[idx]
+        if idx in active_task_map:
             working_role = active_task_map[idx]
-            task_lines.append(f"{C_YELLOW}{_truncate_line(f'  ▶ [{status}] {title}')}{C_RESET}")
+            fg_lines.append(f"{C_YELLOW}{_truncate_line(f'  ▶ [{status}:{working_role}] {title}')}{C_RESET}")
 
             branch_list = list(telemetry.role_branches.get(working_role, []))
             for b_i, b in enumerate(branch_list):
-                if len(task_lines) >= TOTAL_TASK_SECTION_LINES:
+                if len(fg_lines) >= TOTAL_TASK_SECTION_LINES:
                     break
                 arm = "└─" if b_i == len(branch_list) - 1 else "├─"
                 sub_arm = "   └─" if b_i == len(branch_list) - 1 else "│  └─"
 
-                task_lines.append(f"{C_CYAN}{_truncate_line(f'  │  {arm} [{b.role}] {b.action}')}{C_RESET}")
-                if len(task_lines) < TOTAL_TASK_SECTION_LINES:
-                    task_lines.append(f"{C_WHITE}{_truncate_line(f'  │  {sub_arm} Result: {b.result}')}{C_RESET}")
+                fg_lines.append(f"{C_CYAN}{_truncate_line(f'  │  {arm} [{b.role}] {b.action}')}{C_RESET}")
+                if len(fg_lines) < TOTAL_TASK_SECTION_LINES:
+                    fg_lines.append(f"{C_WHITE}{_truncate_line(f'  │  {sub_arm} Result: {b.result}')}{C_RESET}")
         else:
-            task_lines.append(f"{C_WHITE}{_truncate_line(f'  - [{status}] {title}')}{C_RESET}")
+            fg_lines.append(f"{C_WHITE}{_truncate_line(f'  - [{status}] {title}')}{C_RESET}")
+
+    remaining_slots = max(0, TOTAL_TASK_SECTION_LINES - len(fg_lines))
+    recent_done_indices = done_indices[-remaining_slots:] if remaining_slots > 0 else []
+    for idx in recent_done_indices:
+        _, title = tasks[idx]
+        task_lines.append(f"{C_GREEN}{_truncate_line(f'  ✔ [DONE] {title}')}{C_RESET}")
+
+    task_lines.extend(fg_lines)
 
     if not task_lines:
         task_lines.append(f"{C_WHITE}  (現在登録されているタスクはありません){C_RESET}")
@@ -356,21 +401,30 @@ async def render_status_box() -> str:
         task_lines.append(" ")
 
     lines.extend(task_lines)
-    return "```ansi\n" + "\n".join(lines) + "\n```"
+    return _wrap_ansi_box(lines)
 
 
-def _format_fixed_block(text: str, fixed_lines: int, line_width: int = 74) -> list[str]:
-    """任意の生テキストを指定文字幅で折り返し、必ず fixed_lines 行のリストに整形する"""
+def _format_fixed_block(text: str, fixed_lines: int, max_width: int = 68) -> list[str]:
+    """見た目上の横幅（全角2/半角1）で折り返し、必ず fixed_lines 行のリストに整形する"""
     wrapped: list[str] = []
     for raw_line in text.splitlines() or [""]:
         line = raw_line.strip("\r")
         if not line:
             wrapped.append("  ")
             continue
-        while len(line) > line_width:
-            wrapped.append("  " + line[:line_width])
-            line = line[line_width:]
-        wrapped.append("  " + line)
+        buf: list[str] = []
+        w = 0
+        for ch in line:
+            cw = 2 if unicodedata.east_asian_width(ch) in ("F", "W", "A") else 1
+            if w + cw > max_width and buf:
+                wrapped.append("  " + "".join(buf))
+                buf = [ch]
+                w = cw
+            else:
+                buf.append(ch)
+                w += cw
+        if buf:
+            wrapped.append("  " + "".join(buf))
 
     if len(wrapped) > fixed_lines:
         wrapped = wrapped[: fixed_lines - 1]
@@ -383,13 +437,13 @@ def _format_fixed_block(text: str, fixed_lines: int, line_width: int = 74) -> li
 
 
 def render_raw_log_box() -> str:
-    """log-raw チャンネル向けに横幅・上下行数（全27行）を完全固定した生ログBoxを生成する"""
-    divider = f"{C_WHITE}{'─' * 84}{C_RESET}"
+    """log-raw チャンネル向けに横幅・上下行数・2000文字上限を厳守した生ログBoxを生成する"""
+    divider = f"{C_WHITE}{'─' * 76}{C_RESET}"
 
-    thought_lines = _format_fixed_block(telemetry.raw_thought, fixed_lines=7)
+    thought_lines = _format_fixed_block(telemetry.raw_thought, fixed_lines=7, max_width=68)
     args_text = f"Tool : {telemetry.raw_tool_name}\nArgs : {telemetry.raw_tool_args}"
-    args_lines = _format_fixed_block(args_text, fixed_lines=5)
-    output_lines = _format_fixed_block(telemetry.raw_tool_output, fixed_lines=8)
+    args_lines = _format_fixed_block(args_text, fixed_lines=4, max_width=68)
+    output_lines = _format_fixed_block(telemetry.raw_tool_output, fixed_lines=7, max_width=68)
 
     lines: list[str] = [
         (
@@ -410,4 +464,4 @@ def render_raw_log_box() -> str:
         *[f"{C_GREEN}{l}{C_RESET}" for l in output_lines],
     ]
 
-    return "```ansi\n" + "\n".join(lines) + "\n```"
+    return _wrap_ansi_box(lines)

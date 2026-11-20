@@ -23,7 +23,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "path": {"type": "string", "description": "File path starting with ~/"},
                     "start_line": {"type": "integer", "description": "1-based start line (default 1)"},
                     "end_line": {"type": "integer", "description": "1-based end line (inclusive)"},
-                    "max_lines": {"type": "integer", "description": "Max lines to read (default 500)"},
+                    "max_lines": {"type": "integer", "description": "Max lines to read (default 2000)"},
                 },
                 "required": ["path"],
             },
@@ -54,7 +54,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "items": {"type": "string"},
                         "description": "Optional file extensions filter (e.g. ['.py', '.md']).",
                     },
-                    "max_lines_per_file": {"type": "integer", "description": "Max lines per file (default 500)."},
+                    "max_lines_per_file": {"type": "integer", "description": "Max lines per file (default 1000)."},
                 },
             },
         },
@@ -228,10 +228,11 @@ def get_tools_for_role(tool_names: list[str]) -> list[dict[str, Any]]:
 
 
 BATCH_EFFICIENCY_NOTE = (
-    "【大容量コンテキスト活用・一括処理ルール】\n"
+    "【大容量コンテキスト活用・一括処理＆並列安全ルール】\n"
     "- 推論回数を最小化するため、ファイルを1つずつ確認せず `read_files`（複数パスやディレクトリ指定）や `search_files` で一括閲覧してください。\n"
     "- ファイル閲覧時は左側に1始まりの行番号（`   1 | ...`）が表示されます。部分編集を行う際は `edit_lines` を使い、`start_line` と `end_line` を指定して複数箇所・複数ファイルを1回で一括置換してください。\n"
-    "- 複数ファイルの新規作成には `write_files` を使用して1ステップで完了させてください。"
+    "- 複数ファイルの新規作成には `write_files` を使用して1ステップで完了させてください。\n"
+    "- PMと他部門は並列稼働するため、`~/TASK.md` を更新する際は他部門の追記を消さないよう `write_file` で全文上書きせず、直前に `read_file` で行番号を確認して `edit_lines` または `replace_in_file` で該当箇所のみ部分更新してください。"
 )
 
 ROLE_PROMPTS: dict[str, str] = {

@@ -212,16 +212,16 @@ def get_status_update_interval_sec() -> int:
     return get_env_int("STATUS_UPDATE_INTERVAL_SEC", 120) or 120
 
 
-def get_desktop_vram_gb() -> float:
-    return get_env_float("DESKTOP_VRAM_GB", 8.0) or 8.0
+def get_desktop_vram_gb() -> float | None:
+    return get_env_float("DESKTOP_VRAM_GB")
 
 
-def get_desktop_ram_gb() -> float:
-    return get_env_float("DESKTOP_RAM_GB", 8.0) or 8.0
+def get_desktop_ram_gb() -> float | None:
+    return get_env_float("DESKTOP_RAM_GB")
 
 
-def get_server_ctx_size() -> int:
-    return get_env_int("SERVER_CTX_SIZE", 4086) or 4086
+def get_server_ctx_size() -> int | None:
+    return get_env_int("SERVER_CTX_SIZE")
 
 
 def get_raw_log_channel_id() -> int | None:
@@ -266,3 +266,30 @@ def get_desktop_metrics_url() -> str | None:
 
 def get_sandbox_env_hint() -> str | None:
     return get_env_str("SANDBOX_ENV_HINT")
+
+
+# --- Concurrency, Streaming Granularity & 256k Context Budget ---
+def get_ollama_num_parallel() -> int | None:
+    """Ollamaの並列推論数（OSS公開用に未設定時は None）"""
+    val = get_env_int("OLLAMA_NUM_PARALLEL")
+    return max(1, val) if val is not None else None
+
+
+def get_stream_granularity_tokens() -> int:
+    """LLMストリーミング受信時に何トークン（チャンク）粒度でモニター・生ログを更新するか"""
+    return max(1, get_env_int("STREAM_GRANULARITY_TOKENS", 20) or 20)
+
+
+def get_io_chunk_bytes() -> int:
+    """巨大コマンドstdin送信・ファイル読み込み時のストリーミングチャンク粒度（バイト）"""
+    return max(4096, get_env_int("IO_CHUNK_BYTES", 65536) or 65536)
+
+
+def get_max_ctx_chars_budget() -> int:
+    """
+    SERVER_CTX_SIZE からシステムプロンプト・出力予約枠を除いた
+    メッセージ履歴全体の安全な最大文字数予算を算出する。
+    """
+    ctx_tokens = get_server_ctx_size() or 4096
+    return max(24_000, int(ctx_tokens * 2.2 * 0.75))
+
