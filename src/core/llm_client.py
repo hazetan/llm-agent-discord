@@ -8,6 +8,10 @@ from typing import Any
 import aiohttp
 
 from .config import (
+    get_heavy_model_for_role,
+    get_heavy_ollama_keep_alive,
+    get_heavy_ollama_options,
+    get_heavy_ollama_think,
     get_llm_timeout,
     get_model_for_role,
     get_ollama_chat_url,
@@ -396,3 +400,72 @@ async def warmup_models() -> None:
                         )
         except Exception as exc:
             system_logger.error("LLM_CLIENT", f"[WARMUP] Exception while preloading {model_name}: {exc}", exc)
+
+
+async def generate_heavy_brain(
+    role: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> tuple[str, str, float, str, float]:
+    """
+    Stage 2 (Pure Brain): 重量モデル (MODEL_HEAVY) をツール無しで1回だけ呼び出し、
+    (thinking_text, clean_markdown, latency_sec, model_name, tps) を返す。
+    実行中は全並列枠をロックしてVRAM/RAM競合を防ぎ、完了後は HEAVY_KEEP_ALIVE に従い即解放する。
+    """
+    model_name = get_heavy_model_for_role(role)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    prepared_msgs = _prepare_messages_for_ollama(messages)
+
+    payload: dict[str, Any] = {
+        "model": model_name,
+        "messages": prepared_msgs,
+        "stream": True,
+    }
+
+    think_setting = get_heavy_ollama_think()
+    if think_setting is not None:
+        payload["think"] = think_setting
+
+    options = get_heavy_ollama_options()
+    if options:
+        payload["options"] = options
+
+    keep_alive = get_heavy_ollama_keep_alive()
+    if keep_alive is not None:
+        payload["keep_alive"] = keep_alive
+
+    est_chars = len(json.dumps(prepared_msgs, ensure_ascii=False))
+    est_input_tok = max(1, est_chars // 3)
+    telemetry.update_role_tokens(role, est_input_tok)
+
+    start_t = time.perf_counter()
+    total_sem, bg_sem = _get_llm_semaphores()
+
+    system_logger.log("LLM_CLIENT", f"[{role}:HEAVY] Acquiring exclusive semaphores for {model_name}...")
+    async with bg_sem:
+        async with total_sem:
+            system_logger.log("LLM_CLIENT", f"[{role}:HEAVY] Exclusive lock acquired. Streaming {model_name}...")
+            msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _execute_ollama_stream(
+                role, model_name, payload, est_input_tok
+            )
+
+    if prompt_tok == 0:
+        prompt_tok = est_input_tok
+
+    raw_content = msg.get("content") or ""
+    explicit_thinking = msg.get("thinking") or ""
+    if eval_tok == 0:
+        eval_tok = max(1, len(raw_content + explicit_thinking) // 3)
+
+    if eval_duration_ns > 0:
+        tps = eval_tok / (eval_duration_ns / 1e9)
+    else:
+        tps = eval_tok / elapsed_req
+
+    telemetry.update_role_tokens(role, prompt_tok + eval_tok, tps=tps)
+    thinking_text, clean_content = extract_thinking_and_clean(raw_content, explicit_thinking)
+    latency = time.perf_counter() - start_t
+    return thinking_text, clean_content, latency, model_name, tps

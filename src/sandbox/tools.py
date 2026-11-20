@@ -554,3 +554,79 @@ async def execute_tool(name: str, raw_args: Any) -> str:
             return await asyncio.to_thread(fn, args)
 
     return await asyncio.to_thread(fn, args)
+
+
+HEAVY_FILE_BLOCK_PATTERN = re.compile(
+    r"(?:^|\n)#+\s*FILE\s*:\s*([^\n]+)\n+```[^\n]*\n(.*?)```",
+    re.DOTALL,
+)
+
+
+def build_heavy_context_bundle(context_paths: list[str]) -> str:
+    """
+    Stage 2 用に、指定されたファイル・ディレクトリ群をPythonで高速に一括読み込みし、
+    行番号なしのクリーンなテキストバンドルとして結合する。
+    """
+    ws = get_workspace_dir().resolve()
+    char_budget = int(get_max_ctx_chars_budget(is_heavy=True) * 0.65)
+    collected: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(p: Path) -> None:
+        r = p.resolve()
+        if r not in seen and _is_readable_text_file(r):
+            seen.add(r)
+            collected.append(r)
+
+    for raw_p in context_paths:
+        target = resolve_workspace_path(str(raw_p))
+        if not target or not target.exists():
+            continue
+        if target.is_dir():
+            for root, dirs, files in os.walk(target):
+                dirs[:] = sorted(d for d in dirs if d not in IGNORE_DIRS and not d.startswith("."))
+                for f in sorted(files):
+                    _add(Path(root) / f)
+        else:
+            _add(target)
+
+    if not collected:
+        return "(追加の参照ファイルなし)"
+
+    sections: list[str] = []
+    used_chars = 0
+    for fpath in collected:
+        rel = fpath.relative_to(ws)
+        text = fpath.read_text(encoding="utf-8", errors="replace")
+        if used_chars + len(text) > char_budget and sections:
+            sections.append(f"=== ~/{rel} (Skipped: Heavy context budget reached) ===")
+            continue
+        sections.append(f"=== FILE: ~/{rel} ===\n{text}")
+        used_chars += len(text)
+
+    return "\n\n".join(sections)
+
+
+def auto_apply_heavy_markdown(markdown_text: str) -> list[str]:
+    """
+    Stage 3 (Auto-Apply): 重量モデルが出力した Markdown から
+    '### FILE: ~/path/to/file' + コードブロック を抽出し、0秒で自動保存する。
+    """
+    ws = get_workspace_dir().resolve()
+    applied_reports: list[str] = []
+
+    for match in HEAVY_FILE_BLOCK_PATTERN.finditer(markdown_text):
+        raw_path = match.group(1).strip().strip("`'\"")
+        code_body = match.group(2)
+        target = resolve_workspace_path(raw_path)
+        if not target or target.is_dir():
+            applied_reports.append(f"[ERROR] Invalid target path skipped: {raw_path}")
+            continue
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(code_body, encoding="utf-8")
+        rel = target.relative_to(ws)
+        line_cnt = len(code_body.splitlines())
+        applied_reports.append(f"~/{rel} ({line_cnt} lines, {len(code_body)} chars)")
+
+    return applied_reports
