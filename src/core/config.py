@@ -93,7 +93,7 @@ def get_monitored_channel_ids() -> set[int]:
     return ids
 
 
-# --- Ollama & Models (Defaults are None for OSS privacy) ---
+# --- Ollama & Models ---
 def get_ollama_base_url() -> str:
     base = require_env("OLLAMA_BASE_URL")
     if not base.startswith(("http://", "https://")):
@@ -159,12 +159,7 @@ def get_heavy_ollama_keep_alive() -> str | None:
 
 
 def get_ollama_options() -> dict[str, Any]:
-    """
-    .env に設定されている Ollama パラメータのみを辞書として構築する。
-    デフォルト値はすべて None とし、未設定の項目は送信しない。
-    """
     opts: dict[str, Any] = {}
-
     int_mappings = {
         "SERVER_CTX_SIZE": "num_ctx",
         "MAX_TOKEN": "num_predict",
@@ -197,9 +192,7 @@ def get_ollama_options() -> dict[str, Any]:
 
 
 def get_heavy_ollama_options() -> dict[str, Any]:
-    """重量モデル (MODEL_HEAVY) 用の Ollama パラメータ辞書を .env から構築する"""
     opts: dict[str, Any] = {}
-
     int_mappings = {
         "HEAVY_CTX_SIZE": "num_ctx",
         "HEAVY_MAX_TOKEN": "num_predict",
@@ -230,6 +223,7 @@ def get_heavy_ollama_options() -> dict[str, Any]:
 
     return opts
 
+
 def get_llm_timeout() -> int:
     return require_env_int("LLM_TIMEOUT")
 
@@ -256,6 +250,7 @@ def get_log_dir() -> Path:
     return _resolve_dir("LOG_DIR")
 
 
+# --- Execution Parameters ---
 def get_docker_image() -> str:
     return require_env("DOCKER_IMAGE")
 
@@ -280,8 +275,38 @@ def get_auditor_interval_sec() -> int:
     return require_env_int("AUDITOR_INTERVAL_SEC")
 
 
+# --- Autonomous Mode Settings ---
+def get_autonomous_enable() -> bool:
+    return require_env_bool("AUTONOMOUS_ENABLE")
+
+
+def get_autonomous_idle_sec() -> int:
+    return require_env_int("AUTONOMOUS_IDLE_SEC")
+
+
+def get_autonomous_max_steps() -> int:
+    return require_env_int("AUTONOMOUS_MAX_STEPS")
+
+
+# --- Status Monitor & Hardware Specs ---
+def get_ollama_ps_url() -> str:
+    return f"{get_ollama_base_url()}/api/ps"
+
+
+def get_status_channel_id() -> int | None:
+    return get_env_int("DISCORD_STATUS_CHANNEL_ID")
+
+
 def get_status_update_interval_sec() -> int:
     return require_env_int("STATUS_UPDATE_INTERVAL_SEC")
+
+
+def get_desktop_vram_gb() -> float | None:
+    return get_env_float("DESKTOP_VRAM_GB")
+
+
+def get_desktop_ram_gb() -> float | None:
+    return get_env_float("DESKTOP_RAM_GB")
 
 
 def get_server_ctx_size() -> int | None:
@@ -292,12 +317,25 @@ def get_heavy_ctx_size() -> int | None:
     return get_env_int("HEAVY_CTX_SIZE")
 
 
+def get_raw_log_channel_id() -> int | None:
+    return get_env_int("DISCORD_RAW_LOG_CHANNEL_ID")
+
+
+# --- NAS (WebUI / WebDAV / Samba) Settings ---
 def get_nas_enable() -> bool:
     return require_env_bool("NAS_ENABLE")
 
 
 def get_nas_port() -> int:
     return require_env_int("NAS_PORT")
+
+
+def get_nas_user() -> str | None:
+    return get_env_str("NAS_USER")
+
+
+def get_nas_password() -> str | None:
+    return get_env_str("NAS_PASSWORD")
 
 
 def get_samba_enable() -> bool:
@@ -308,20 +346,27 @@ def get_samba_port() -> int:
     return require_env_int("SAMBA_PORT")
 
 
-def get_ollama_num_parallel() -> int:
-    return require_env_int("OLLAMA_NUM_PARALLEL")
+def get_desktop_metrics_url() -> str | None:
+    return get_env_str("DESKTOP_METRICS_URL")
+
+
+def get_sandbox_env_hint() -> str | None:
+    return get_env_str("SANDBOX_ENV_HINT")
+
+
+# --- Concurrency, Streaming Granularity & Context Budget ---
+def get_ollama_num_parallel() -> int | None:
+    val = get_env_int("OLLAMA_NUM_PARALLEL")
+    return max(1, val) if val is not None else None
 
 
 def get_stream_granularity_tokens() -> int:
-    return require_env_int("STREAM_GRANULARITY_TOKENS")
+    return max(1, require_env_int("STREAM_GRANULARITY_TOKENS"))
 
 
 def get_io_chunk_bytes() -> int:
-    return require_env_int("IO_CHUNK_BYTES")
+    return max(4096, require_env_int("IO_CHUNK_BYTES"))
 
 
 def get_max_ctx_chars_budget(is_heavy: bool = False) -> int:
-    ctx_tokens = require_env_int("HEAVY_CTX_SIZE" if is_heavy else "SERVER_CTX_SIZE")
-    chars_per_tok = require_env_float("CTX_CHARS_PER_TOKEN")
-    safety_ratio = require_env_float("CTX_SAFETY_RATIO")
-    return int(ctx_tokens * chars_per_tok * safety_ratio)
+    return require_env_int("CTX_CHAR_BUDGET_HEAVY" if is_heavy else "CTX_CHAR_BUDGET_LIGHT")

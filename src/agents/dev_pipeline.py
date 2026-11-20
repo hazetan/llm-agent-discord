@@ -1,12 +1,20 @@
 import asyncio
 import re
+import time
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-from core.config import get_pipeline_idle_sec
+from core.config import (
+    get_autonomous_enable,
+    get_autonomous_idle_sec,
+    get_autonomous_max_steps,
+    get_pipeline_idle_sec,
+)
 from core.logger import system_logger
+from core.telemetry import telemetry
 from sandbox.tools import read_workspace_doc
 
+from .roles import AUTONOMOUS_INITIATIVE_PROMPT
 from .runner import run_role_phase
 
 StatusCallback = Callable[[str], Coroutine[Any, Any, None]]
@@ -60,9 +68,33 @@ async def _execute_single_role(role: str, on_phase_complete: StatusCallback | No
         await asyncio.sleep(30)
 
 
+async def _execute_autonomous_initiative(on_phase_complete: StatusCallback | None) -> None:
+    """未処理タスクがないアイドル時に、軽量モデルでファイル整理整頓と新規[TODO]タスクの自律起票を行う"""
+    system_logger.log("DEV_PIPELINE", "Autonomous initiative worker started (role=SE).")
+    try:
+        summary, _ = await run_role_phase(
+            "SE",
+            AUTONOMOUS_INITIATIVE_PROMPT,
+            max_steps=get_autonomous_max_steps(),
+        )
+    except Exception as exc:
+        print(f"[DevPipeline Error (AUTONOMOUS)] {exc}")
+        system_logger.error("DEV_PIPELINE", f"Autonomous worker error: {exc}", exc)
+        await asyncio.sleep(30)
+        return
+
+    if summary.strip():
+        system_logger.log("DEV_PIPELINE", "Autonomous initiative completed successfully.")
+        if on_phase_complete:
+            await on_phase_complete(f"**[自律行動・整理整頓＆自己タスク起票 完了報告]**\n{summary}")
+    else:
+        system_logger.log("DEV_PIPELINE", "Autonomous worker finished without complete_phase.", level="WARN")
+
+
 async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None = None) -> None:
     """
-    未処理タスクが存在する役職 (QA, PG, SE) を各役職最大1人ずつ同時に並列実行するループ
+    未処理タスクが存在する役職 (QA, PG, SE) を各役職最大1人ずつ同時に並列実行し、
+    全タスク完了後のアイドル状態が一定時間続いた場合は自律行動（整理整頓・自己起票）を発動するループ
     """
     running_tasks: dict[str, asyncio.Task[None]] = {}
     raw_task_md = read_workspace_doc("~/TASK.md")
@@ -71,6 +103,7 @@ async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None 
         f"continuous_dev_pipeline_loop started. Current ~/TASK.md ({len(raw_task_md)} chars):\n{raw_task_md.strip()}",
     )
     last_pending: list[str] | None = None
+    idle_since: float = time.monotonic()
 
     try:
         while True:
@@ -78,6 +111,7 @@ async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None 
                 for role, task in list(running_tasks.items()):
                     if task.done():
                         running_tasks.pop(role, None)
+                        idle_since = time.monotonic()
                         try:
                             task.result()
                         except asyncio.CancelledError:
@@ -100,8 +134,20 @@ async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None 
                         )
 
                 if not running_tasks:
-                    await asyncio.sleep(get_pipeline_idle_sec())
-                    continue
+                    if (
+                        get_autonomous_enable()
+                        and "PM" not in telemetry.active_roles
+                        and (time.monotonic() - idle_since) >= get_autonomous_idle_sec()
+                    ):
+                        system_logger.log("DEV_PIPELINE", "Idle threshold reached. Spawning autonomous initiative task...")
+                        idle_since = time.monotonic()
+                        running_tasks["SE"] = asyncio.create_task(
+                            _execute_autonomous_initiative(on_phase_complete),
+                            name="worker_AUTONOMOUS_SE",
+                        )
+                    else:
+                        await asyncio.sleep(get_pipeline_idle_sec())
+                        continue
 
                 await asyncio.wait(
                     running_tasks.values(),

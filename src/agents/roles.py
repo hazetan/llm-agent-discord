@@ -323,8 +323,8 @@ ROLE_ALLOWED_TOOLS: dict[str, list[str]] = {
     ],
     "SE": [
         "list_files", "read_file", "read_files", "search_files",
-        "invoke_heavy_brain", "edit_lines", "replace_in_file",
-        "web_search", "fetch_url", "complete_phase",
+        "invoke_heavy_brain", "write_file", "edit_lines", "replace_in_file",
+        "run_command", "web_search", "fetch_url", "complete_phase",
     ],
     "PG": [
         "list_files", "read_file", "read_files", "search_files",
@@ -361,3 +361,18 @@ HEAVY_BRAIN_PROMPTS: dict[str, str] = {
         "```\n"
     ),
 }
+
+AUTONOMOUS_INITIATIVE_PROMPT = (
+    "現在 `~/TASK.md` に未完了タスク（TODO / IMPL / FIX / QA）が存在せず、システムがアイドル状態です。\n"
+    "自律行動モードとして、ワークスペース (`~/`) 全体を調査し、以下の1〜3を順番に実行してください：\n\n"
+    "1. 【ファイル整理整頓・クリーニング】\n"
+    "   - `list_files` で `~/` 配下を確認し、散らかった一時ファイル・不要なログ・重複ファイル・未整理のディレクトリがあれば、`run_command`（`mv`, `rm`, `mkdir` 等）で美しく整理整頓してください。\n"
+    "   - `~/README.md`（プロジェクト台帳）が現在の実際のディレクトリ構成・ファイル一覧と一致するように最新化してください。\n"
+    "   - `~/TASK.md` に完了済みの `[DONE]` タスクが大量に溜まっている場合は、直近の履歴を残してコンパクトに整理してください。\n\n"
+    "2. 【品質点検・改善タスクの自己起票】\n"
+    "   - `~/REPORT.md` の監査指摘や既存プロジェクトのコード・テスト状況を確認してください。\n"
+    "   - リファクタリング、単体テスト・自動検証スクリプトの拡充、エラーハンドリング強化、ドキュメント整備、または機能改善など、"
+    "次に開発ラインが取り組むべき具体的で価値の高いタスクを1件考案し、`~/TASK.md` に `- [TODO] ...` として起票（追記）してください。\n\n"
+    "3. 【完了報告】\n"
+    "   - 実施した整理整頓の内容と、新たに起票した `[TODO]` タスクの概要を `complete_phase` で報告してください。"
+)
