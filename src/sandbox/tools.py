@@ -556,12 +556,6 @@ async def execute_tool(name: str, raw_args: Any) -> str:
     return await asyncio.to_thread(fn, args)
 
 
-HEAVY_FILE_BLOCK_PATTERN = re.compile(
-    r"(?:^|\n)#+\s*FILE\s*:\s*([^\n]+)\n+```[^\n]*\n(.*?)```",
-    re.DOTALL,
-)
-
-
 def build_heavy_context_bundle(context_paths: list[str]) -> str:
     """
     Stage 2 用に、指定されたファイル・ディレクトリ群をPythonで高速に一括読み込みし、
@@ -607,17 +601,37 @@ def build_heavy_context_bundle(context_paths: list[str]) -> str:
     return "\n\n".join(sections)
 
 
+HEAVY_FILE_HEADER_PATTERN = re.compile(
+    r"(?:^|\n)[ \t]*(?:#+|\*\*|-)?[ \t]*FILE[ \t]*:[ \t]*([^\n]+)",
+)
+
+
 def auto_apply_heavy_markdown(markdown_text: str) -> list[str]:
     """
     Stage 3 (Auto-Apply): 重量モデルが出力した Markdown から
-    '### FILE: ~/path/to/file' + コードブロック を抽出し、0秒で自動保存する。
+    '### FILE: ~/path/to/file' セクションを分割し、内部にネストしたコードブロックが
+    あっても途切れないようセクション内の最初と最後の ``` の間を抽出して自動保存する。
     """
     ws = get_workspace_dir().resolve()
     applied_reports: list[str] = []
 
-    for match in HEAVY_FILE_BLOCK_PATTERN.finditer(markdown_text):
-        raw_path = match.group(1).strip().strip("`'\"")
-        code_body = match.group(2)
+    matches = list(HEAVY_FILE_HEADER_PATTERN.finditer(markdown_text))
+    for idx, match in enumerate(matches):
+        raw_path = match.group(1).strip().strip("`'\"* ")
+        section_start = match.end()
+        section_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(markdown_text)
+        section = markdown_text[section_start:section_end]
+
+        first_fence = re.search(r"```[^\n]*\n", section)
+        if not first_fence:
+            continue
+        content_start = first_fence.end()
+        last_fence_pos = section.rfind("```")
+        if last_fence_pos <= first_fence.start():
+            code_body = section[content_start:]
+        else:
+            code_body = section[content_start:last_fence_pos]
+
         target = resolve_workspace_path(raw_path)
         if not target or target.is_dir():
             applied_reports.append(f"[ERROR] Invalid target path skipped: {raw_path}")

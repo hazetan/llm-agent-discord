@@ -45,10 +45,10 @@ def build_fresh_workspace_snapshot() -> str:
 def _enforce_context_budget(messages: list[dict[str, Any]], budget_chars: int) -> None:
     """
     累積メッセージ長が256kコンテキスト予算を超えないよう、
-    古い tool 出力メッセージから順に中間を折りたたんでシステムプロンプトを保護する。
+    実際にOllamaへ送信される _clean_content ベースで計算し、古い tool 出力から圧縮する。
     """
     def _total_chars() -> int:
-        return sum(len(str(m.get("content") or "")) for m in messages)
+        return sum(len(str(m.get("_clean_content", m.get("content") or ""))) for m in messages)
 
     if _total_chars() <= budget_chars:
         return
@@ -156,12 +156,6 @@ async def run_role_phase(
 
                 telemetry.add_branch_event(role, fn_name, parsed_args, output)
 
-                telemetry.record_raw_step(
-                    role, model_name, step, steps_limit, latency, thought, fn_name, parsed_args, output, tps=tps
-                )
-                if telemetry.on_raw_update:
-                    await telemetry.on_raw_update()
-
                 if output.startswith("ZIP_CREATED:"):
                     created_zips.append(output.split("ZIP_CREATED:", 1)[1].strip())
 
@@ -238,6 +232,13 @@ async def _execute_heavy_brain_stage(
         f"=== 出力対象ファイル（必ず以下のヘッダとコードブロックで全文を出力すること） ===\n{target_fmt_hint}\n"
     )
 
+    telemetry.record_raw_step(
+        f"{role}:HEAVY", "HEAVY_MODEL", step, steps_limit, 0.0,
+        "(Heavy Brain 推論開始...)", "invoke_heavy_brain", parsed_args, "(執筆中...)",
+    )
+    if telemetry.on_raw_update:
+        await telemetry.on_raw_update()
+
     thinking_text, clean_md, h_latency, h_model, h_tps = await generate_heavy_brain(
         role, heavy_sys_prompt, heavy_user_prompt
     )
@@ -250,10 +251,14 @@ async def _execute_heavy_brain_stage(
     )
     tool_output = f"{summary_header}\n\n[Heavy Brain Output Preview]\n{clean_md[:4000]}"
 
-    combined_thought = f"[Heavy Brain Thinking ({h_model})]\n{thinking_text}" if thinking_text else f"[Heavy Brain ({h_model})]"
+    combined_thought = (
+        f"[Heavy Brain Thinking ({h_model})]\n{thinking_text}"
+        if thinking_text
+        else f"[Heavy Brain Output ({h_model})]\n{clean_md[:1500]}"
+    )
     logger.log_step(step, combined_thought, "invoke_heavy_brain", parsed_args, summary_header, h_latency, tps=h_tps)
     telemetry.record_raw_step(
-        role, h_model, step, steps_limit, h_latency, combined_thought,
+        f"{role}:HEAVY", h_model, step, steps_limit, h_latency, combined_thought,
         "invoke_heavy_brain", parsed_args, summary_header, tps=h_tps,
     )
     if telemetry.on_raw_update:

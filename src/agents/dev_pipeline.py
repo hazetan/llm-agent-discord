@@ -53,8 +53,9 @@ async def _execute_single_role(role: str, on_phase_complete: StatusCallback | No
     try:
         summary, _ = await run_role_phase(role, instruction)
     except Exception as exc:
-        print(f"[DevPipeline Error ({role})] {exc}")
-        system_logger.error("DEV_PIPELINE", f"Worker error in role={role}: {exc}", exc)
+        err_detail = f"{type(exc).__name__}: {exc}"
+        print(f"[DevPipeline Error ({role})] {err_detail}")
+        system_logger.error("DEV_PIPELINE", f"Worker error in role={role}: {err_detail}", exc)
         await asyncio.sleep(30)
         return
 
@@ -78,8 +79,9 @@ async def _execute_autonomous_initiative(on_phase_complete: StatusCallback | Non
             max_steps=get_autonomous_max_steps(),
         )
     except Exception as exc:
-        print(f"[DevPipeline Error (AUTONOMOUS)] {exc}")
-        system_logger.error("DEV_PIPELINE", f"Autonomous worker error: {exc}", exc)
+        err_detail = f"{type(exc).__name__}: {exc}"
+        print(f"[DevPipeline Error (AUTONOMOUS)] {err_detail}")
+        system_logger.error("DEV_PIPELINE", f"Autonomous worker error: {err_detail}", exc)
         await asyncio.sleep(30)
         return
 
@@ -117,8 +119,9 @@ async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None 
                         except asyncio.CancelledError:
                             raise
                         except Exception as exc:
-                            print(f"[DevPipeline Error ({role})] {exc}")
-                            system_logger.error("DEV_PIPELINE", f"Task result error ({role}): {exc}", exc)
+                            err_detail = f"{type(exc).__name__}: {exc}"
+                            print(f"[DevPipeline Error ({role})] {err_detail}")
+                            system_logger.error("DEV_PIPELINE", f"Task result error ({role}): {err_detail}", exc)
 
                 pending_roles = detect_pending_roles()
                 if pending_roles != last_pending:
@@ -159,8 +162,9 @@ async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None 
                 system_logger.log("DEV_PIPELINE", "continuous_dev_pipeline_loop cancelled.")
                 raise
             except Exception as exc:
-                print(f"[DevPipeline Loop Error] {exc}")
-                system_logger.error("DEV_PIPELINE", f"Loop error: {exc}", exc)
+                err_detail = f"{type(exc).__name__}: {exc}"
+                print(f"[DevPipeline Loop Error] {err_detail}")
+                system_logger.error("DEV_PIPELINE", f"Loop error: {err_detail}", exc)
                 await asyncio.sleep(5)
     finally:
         for task in running_tasks.values():

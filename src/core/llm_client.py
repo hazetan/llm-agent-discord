@@ -47,26 +47,33 @@ def _get_llm_semaphores() -> tuple[asyncio.Semaphore, asyncio.Semaphore]:
 def extract_thinking_and_clean(raw_content: str, explicit_thinking: str = "") -> tuple[str, str]:
     """
     レスポンスから (思考テキスト, クリーンな本文) を分離・抽出する。
+    <think>, <thought>, <|channel>thought...<channel|> および未クローズ状態に対応。
     """
     think_parts: list[str] = []
     if explicit_thinking and explicit_thinking.strip():
         think_parts.append(explicit_thinking.strip())
 
-    if raw_content:
-        tag_matches = re.findall(r"<think>(.*?)</think>", raw_content, flags=re.DOTALL)
-        for m in tag_matches:
-            if m.strip():
-                think_parts.append(m.strip())
+    cleaned = raw_content or ""
+    if cleaned:
+        tag_patterns = [
+            (r"<think>(.*?)</think>", "<think>", "</think>"),
+            (r"<thought>(.*?)</thought>", "<thought>", "</thought>"),
+            (r"<\|channel>thought\s*(.*?)<channel\|>", "<|channel>thought", "<channel|>"),
+        ]
+        for regex, open_tag, close_tag in tag_patterns:
+            matches = re.findall(regex, cleaned, flags=re.DOTALL)
+            for m in matches:
+                if m.strip():
+                    think_parts.append(m.strip())
+            cleaned = re.sub(regex, "", cleaned, flags=re.DOTALL)
 
-        cleaned = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL)
-        if "<think>" in cleaned and "</think>" not in cleaned:
-            prefix, unclosed_think = cleaned.split("<think>", 1)
-            if unclosed_think.strip():
-                think_parts.append(unclosed_think.strip())
-            cleaned = prefix
+            if open_tag in cleaned and close_tag not in cleaned:
+                prefix, unclosed_think = cleaned.split(open_tag, 1)
+                if unclosed_think.strip():
+                    think_parts.append(unclosed_think.strip())
+                cleaned = prefix
+
         cleaned = cleaned.strip()
-    else:
-        cleaned = ""
 
     combined_think = "\n".join(think_parts).strip()
     return combined_think, cleaned
@@ -134,17 +141,26 @@ HIGH_THINKING_DIRECTIVE = (
 
 
 def _prepare_messages_for_ollama(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Ollama /api/chat 向けにメッセージ配列と tool_calls の arguments (dict形式) を正規化する"""
+    """Ollama /api/chat 向けにメッセージ配列と tool_calls / tool_name を正規化する"""
     prepared: list[dict[str, Any]] = []
     boost = get_think_prompt_boost()
 
     for idx, m in enumerate(messages):
+        role = m.get("role", "user")
         msg_copy: dict[str, Any] = {
-            "role": m.get("role", "user"),
+            "role": role,
             "content": m.get("_clean_content", m.get("content") or ""),
         }
-        if idx == 0 and msg_copy["role"] == "system" and boost:
+        if idx == 0 and role == "system" and boost:
             msg_copy["content"] += HIGH_THINKING_DIRECTIVE
+
+        if role == "tool":
+            tool_name = m.get("tool_name") or m.get("name")
+            if tool_name:
+                msg_copy["tool_name"] = tool_name
+                msg_copy["name"] = tool_name
+            if "tool_call_id" in m:
+                msg_copy["tool_call_id"] = m["tool_call_id"]
 
         if "tool_calls" in m and m["tool_calls"]:
             norm_calls = []
@@ -166,9 +182,14 @@ async def _execute_ollama_stream(
     payload: dict[str, Any],
     est_input_tok: int,
 ) -> tuple[dict[str, Any], int, int, int, float]:
-    """Ollama /api/chat をストリーミング受信し、指定粒度ごとにテレメトリとデバッグログを更新する"""
-    timeout_sec = get_llm_timeout()
-    timeout = aiohttp.ClientTimeout(total=timeout_sec, sock_read=timeout_sec)
+    """Ollama /api/chat をストリーミング受信し、指定粒度ごとにテレメトリと生思考ログを更新する"""
+    is_heavy = role.upper() in telemetry.heavy_active_roles
+    role_label = f"{role.upper()}:HEAVY" if is_heavy else role.upper()
+
+    base_timeout_sec = get_llm_timeout()
+    read_timeout_sec = max(base_timeout_sec, 1800) if is_heavy else base_timeout_sec
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=read_timeout_sec)
+
     granularity = get_stream_granularity_tokens()
     think_setting = payload.get("think")
     chat_url = get_ollama_chat_url()
@@ -184,26 +205,26 @@ async def _execute_ollama_stream(
 
     system_logger.log(
         "LLM_CLIENT",
-        f"[{role}] POST {chat_url} | model={model_name} | est_in_tok={est_input_tok} | think={think_setting} | options={payload.get('options')}",
+        f"[{role_label}] POST {chat_url} | model={model_name} | est_in_tok={est_input_tok} | think={think_setting} | options={payload.get('options')}",
     )
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         resp = await session.post(chat_url, json=payload)
-        system_logger.log("LLM_CLIENT", f"[{role}] HTTP status={resp.status} received.")
+        system_logger.log("LLM_CLIENT", f"[{role_label}] HTTP status={resp.status} received.")
 
         if resp.status == 400 and isinstance(think_setting, str):
             err_body = await resp.text()
-            system_logger.log("LLM_CLIENT", f"[{role}] 400 with think={think_setting} ({err_body[:120]}). Retrying with think=True...", level="WARN")
+            system_logger.log("LLM_CLIENT", f"[{role_label}] 400 with think={think_setting} ({err_body[:120]}). Retrying with think=True...", level="WARN")
             await resp.release()
             payload["think"] = True
             req_start_t = time.perf_counter()
             resp = await session.post(chat_url, json=payload)
-            system_logger.log("LLM_CLIENT", f"[{role}] Retry HTTP status={resp.status} received.")
+            system_logger.log("LLM_CLIENT", f"[{role_label}] Retry HTTP status={resp.status} received.")
 
         async with resp:
             if resp.status != 200:
                 err_text = await resp.text()
-                system_logger.log("LLM_CLIENT", f"[{role}] Non-200 error body: {err_text}", level="ERROR")
+                system_logger.log("LLM_CLIENT", f"[{role_label}] Non-200 error body: {err_text}", level="ERROR")
                 raise RuntimeError(f"Ollama Error ({resp.status}, model={model_name}): {err_text}")
 
             async for raw_line in resp.content:
@@ -216,7 +237,7 @@ async def _execute_ollama_stream(
                     continue
 
                 if "error" in data:
-                    system_logger.log("LLM_CLIENT", f"[{role}] Stream JSON error: {data['error']}", level="ERROR")
+                    system_logger.log("LLM_CLIENT", f"[{role_label}] Stream JSON error: {data['error']}", level="ERROR")
                     raise RuntimeError(f"Ollama Stream Error ({model_name}): {data['error']}")
 
                 m = data.get("message") or {}
@@ -233,11 +254,27 @@ async def _execute_ollama_stream(
                     chunk_count += 1
                     if chunk_count == 1:
                         first_tok_sec = time.perf_counter() - req_start_t
-                        system_logger.log("LLM_CLIENT", f"[{role}] First token chunk arrived in {first_tok_sec:.2f}s.")
+                        system_logger.log("LLM_CLIENT", f"[{role_label}] First token chunk arrived in {first_tok_sec:.2f}s.")
                     if chunk_count % granularity == 0:
                         elapsed = max(0.001, time.perf_counter() - req_start_t)
                         live_tps = chunk_count / elapsed
                         telemetry.update_role_tokens(role, est_input_tok + chunk_count, tps=live_tps)
+
+                        live_think, live_clean = extract_thinking_and_clean(
+                            "".join(acc_content), "".join(acc_thinking)
+                        )
+                        telemetry.raw_role = role_label
+                        telemetry.raw_model = model_name
+                        telemetry.raw_latency = elapsed
+                        telemetry.raw_tps = live_tps
+                        if live_think and live_clean:
+                            telemetry.raw_thought = f"[Thinking]\n{live_think[-1200:]}\n\n[Drafting]\n{live_clean[-600:]}"
+                        elif live_think:
+                            telemetry.raw_thought = f"[Thinking...]\n{live_think[-1800:]}"
+                        elif live_clean:
+                            telemetry.raw_thought = live_clean[-1800:]
+                        if telemetry.on_raw_update:
+                            await telemetry.on_raw_update()
 
                 if data.get("done"):
                     prompt_tok = int(data.get("prompt_eval_count") or 0)
@@ -248,7 +285,7 @@ async def _execute_ollama_stream(
     elapsed_req = max(0.001, time.perf_counter() - req_start_t)
     system_logger.log(
         "LLM_CLIENT",
-        f"[{role}] Stream done in {elapsed_req:.2f}s | prompt_tok={prompt_tok} | eval_tok={eval_tok} | tool_calls={len(acc_tool_calls)}",
+        f"[{role_label}] Stream done in {elapsed_req:.2f}s | prompt_tok={prompt_tok} | eval_tok={eval_tok} | tool_calls={len(acc_tool_calls)}",
     )
     assembled_msg: dict[str, Any] = {
         "role": "assistant",
@@ -259,7 +296,6 @@ async def _execute_ollama_stream(
         assembled_msg["tool_calls"] = acc_tool_calls
 
     return assembled_msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req
-
 
 async def chat_step(
     role: str,
@@ -402,6 +438,38 @@ async def warmup_models() -> None:
             system_logger.error("LLM_CLIENT", f"[WARMUP] Exception while preloading {model_name}: {exc}", exc)
 
 
+async def _unload_models_for_heavy(heavy_model_name: str) -> None:
+    """
+    70B等の重量モデルをロードする前に、VRAM/RAM上に常駐している別名の通常モデルを
+    keep_alive=0 でアンロードし、16GB VRAM + 64GB RAM をすべて重量モデルへ明け渡す。
+    """
+    models_to_unload: list[str] = []
+    for r in ("PM", "SE", "PG", "QA", "AUDITOR"):
+        try:
+            m = get_model_for_role(r)
+            if m and m != heavy_model_name and m not in models_to_unload:
+                models_to_unload.append(m)
+        except Exception:
+            continue
+
+    if not models_to_unload:
+        return
+
+    chat_url = get_ollama_chat_url()
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for m in models_to_unload:
+            try:
+                system_logger.log("LLM_CLIENT", f"[HEAVY_PREP] Unloading light model '{m}' to free VRAM/RAM for '{heavy_model_name}'...")
+                async with session.post(
+                    chat_url,
+                    json={"model": m, "messages": [], "stream": False, "keep_alive": 0},
+                ) as resp:
+                    await resp.read()
+            except Exception as exc:
+                system_logger.log("LLM_CLIENT", f"[HEAVY_PREP] Unload request warning for '{m}': {exc}", level="WARN")
+
+
 async def generate_heavy_brain(
     role: str,
     system_prompt: str,
@@ -410,9 +478,10 @@ async def generate_heavy_brain(
     """
     Stage 2 (Pure Brain): 重量モデル (MODEL_HEAVY) をツール無しで1回だけ呼び出し、
     (thinking_text, clean_markdown, latency_sec, model_name, tps) を返す。
-    実行中は全並列枠をロックしてVRAM/RAM競合を防ぎ、完了後は HEAVY_KEEP_ALIVE に従い即解放する。
+    実行中は全並列枠をロックして通常モデルをVRAMから退避させ、完了後は即解放する。
     """
     model_name = get_heavy_model_for_role(role)
+    light_model_name = get_model_for_role(role)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -436,6 +505,9 @@ async def generate_heavy_brain(
     keep_alive = get_heavy_ollama_keep_alive()
     if keep_alive is not None:
         payload["keep_alive"] = keep_alive
+    elif model_name != light_model_name:
+        # 通常モデルと別モデル(70B等)の場合はデフォルトで推論直後にメモリを即解放する
+        payload["keep_alive"] = 0
 
     est_chars = len(json.dumps(prepared_msgs, ensure_ascii=False))
     est_input_tok = max(1, est_chars // 3)
@@ -448,7 +520,8 @@ async def generate_heavy_brain(
     try:
         async with bg_sem:
             async with total_sem:
-                system_logger.log("LLM_CLIENT", f"[{role}:HEAVY] Exclusive lock acquired. Streaming {model_name}...")
+                system_logger.log("LLM_CLIENT", f"[{role}:HEAVY] Exclusive lock acquired. Preparing VRAM for {model_name}...")
+                await _unload_models_for_heavy(model_name)
                 msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _execute_ollama_stream(
                     role, model_name, payload, est_input_tok
                 )
